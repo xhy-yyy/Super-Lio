@@ -18,6 +18,7 @@
     lio.sensor.voxel_fliter_size: 0.5
     lio.sensor.gravity_norm: 9.7946
     lio.sensor.imu_type: 1
+    lio.sensor.imu_max_gap: 0.05
     lio.sensor.imu_na: 0.1
     lio.sensor.imu_ng: 0.1
     lio.sensor.imu_nba: 0.0001
@@ -37,6 +38,7 @@
     lio.kf.kf_align_gravity: true
     lio.kf.kf_quit_eps: 0.001
     lio.kf.plane_huber_delta: 0.05  # Meters (0 disables weighting).
+    lio.kf.min_match_ratio: 0.10
 
     lio.output.robot: true
     lio.output.plan_env_world: false

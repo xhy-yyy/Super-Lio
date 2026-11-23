@@ -2,6 +2,8 @@
 #include "lio/super_lio.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <sys/resource.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -197,12 +199,14 @@ void SuperLIO::stateProcess(){
   if(g_time_eva){
     time_record_.Evaluate([this](){Propagation_Undistort();}, "[Undistort]");
     time_record_.Evaluate([this]() { DownSample(); }, "[DownSample]");
-    time_record_.Evaluate([this]() { Observe(); }, "[Observe]");
+    bool accepted = false;
+    time_record_.Evaluate([this, &accepted]() { accepted = Observe(); }, "[Observe]");
+    if (!accepted) return;
     time_record_.Evaluate([this]() { UpdateMap(); }, "[UpdateMap]");
   }else{
     Propagation_Undistort();
     DownSample();
-    Observe();
+    if (!Observe()) return;
     UpdateMap();
   }
   Output();
@@ -423,13 +427,17 @@ void SuperLIO::DownSample(){
 struct ThreadACC{
   M6d HTVH = M6d::Zero();
   V6d HTVr = V6d::Zero();
+  std::size_t inliers = 0;
   ThreadACC(): HTVH(M6d::Zero()), HTVr(V6d::Zero()) {}
 };
 
 
-void SuperLIO::Observe(){
+bool SuperLIO::Observe(){
   size_t ptsize = ds_undistort_->size();
   const double huber_delta = g_plane_huber_delta;
+  const std::size_t min_inliers = g_min_match_ratio > 0.0
+      ? std::max<std::size_t>(20, std::ceil(g_min_match_ratio * ptsize)) : 1;
+  const double inlier_distance = g_min_match_ratio > 0.0 ? 0.15 : std::numeric_limits<double>::infinity();
   
   static std::vector<float> _lengths;
   points_body_v3_.resize(ptsize);
@@ -447,7 +455,7 @@ void SuperLIO::Observe(){
   ivox_->reset_max_group();
   int iter_num = 0;
 
-  kf_->UpdateObserve([&, this](const ESKF::KFState &kf_state, M6 &HTVH, V6 &HTVr) {
+  const bool accepted = kf_->UpdateObserve([&, this](const ESKF::KFState &kf_state, M6 &HTVH, V6 &HTVr) {
     const SE3 pose = kf_state.pose;
     const bool need_converge = kf_state.need_converge;
     const M3d R_transpose = (pose.R_.transpose()).cast<double>();
@@ -493,6 +501,7 @@ void SuperLIO::Observe(){
       
             constexpr double information = 1000.0;
             const double distance = std::abs(static_cast<double>(error));
+            local_acc.inliers += distance <= inlier_distance;
             const double weight = huber_delta > 0.0 && distance > huber_delta
                 ? information * huber_delta / distance : information;
             local_acc.HTVH += (weight * J) * J.transpose();
@@ -503,9 +512,16 @@ void SuperLIO::Observe(){
 
     M6d sum_HTVH = M6d::Zero();
     V6d sum_HTVr = V6d::Zero();
+    std::size_t inliers = 0;
     for(const auto& local_acc : tls_acc){
       sum_HTVH += local_acc.HTVH;
       sum_HTVr += local_acc.HTVr;
+      inliers += local_acc.inliers;
+    }
+    if (inliers < min_inliers) {
+      HTVH.setZero();
+      HTVr.setZero();
+      return;
     }
     HTVH = sum_HTVH.cast<scalar>();
     HTVr = sum_HTVr.cast<scalar>();
@@ -527,6 +543,10 @@ void SuperLIO::Observe(){
   });
 
   frame_num_++;
+  if (!accepted) {
+    LOG_EVERY_N(WARNING, 20) << "Skipping LiDAR scan without a reliable pose update";
+  }
+  return accepted;
 }
 
 

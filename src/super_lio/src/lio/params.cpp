@@ -37,6 +37,7 @@ namespace LI2Sup{
   double g_imu_ng;
   double g_imu_nba;
   double g_imu_nbg;
+  double g_imu_max_gap = 0.0;
 
   SE3 g_lidar_imu;
   SE3 g_odom_robo;
@@ -52,6 +53,7 @@ namespace LI2Sup{
   bool g_kf_align_gravity = true;
   double g_kf_quit_eps;
   double g_plane_huber_delta = 0.0;
+  double g_min_match_ratio = 0.0;
 
   /// submap 
   double g_submap_resolution;

@@ -45,7 +45,7 @@ protected:
   virtual bool map_init();
   void Propagation_Undistort();
   void DownSample();
-  void Observe();
+  bool Observe();
   virtual void UpdateMap();
   virtual void Output();
   void caceData();

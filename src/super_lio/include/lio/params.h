@@ -54,6 +54,7 @@ namespace LI2Sup{
   extern double g_imu_ng;
   extern double g_imu_nba;
   extern double g_imu_nbg;
+  extern double g_imu_max_gap;
 
   extern BASIC::SE3 g_lidar_imu;      // lidar in imu frame
   extern BASIC::SE3 g_odom_robo;      // lidar in robot frame
@@ -69,6 +70,7 @@ namespace LI2Sup{
   extern bool g_kf_align_gravity;
   extern double g_kf_quit_eps;
   extern double g_plane_huber_delta;
+  extern double g_min_match_ratio;
 
   /// submaps
   extern double g_submap_resolution;

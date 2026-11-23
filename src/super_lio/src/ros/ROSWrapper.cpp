@@ -8,6 +8,8 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
+static constexpr std::size_t kLidarQueueDepth = 20;
+
 void LoadParamFromRos(rclcpp::Node& node)
 {
   node.declare_parameter<bool>("lio.map.save_map", false);
@@ -79,6 +81,7 @@ void LoadParamFromRos(rclcpp::Node& node)
 
   node.declare_parameter<double>("lio.sensor.imu_nbg", 0.0);
   node.get_parameter("lio.sensor.imu_nbg", g_imu_nbg);
+  g_imu_max_gap = node.declare_parameter<double>("lio.sensor.imu_max_gap", 0.0);
 
   // ================= extrinsic =================
   std::vector<double> extrinsic_lidar_imu;
@@ -143,6 +146,7 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<double>("lio.kf.kf_quit_eps", 0.0);
   node.get_parameter("lio.kf.kf_quit_eps", g_kf_quit_eps);
   g_plane_huber_delta = node.declare_parameter<double>("lio.kf.plane_huber_delta", 0.0);
+  g_min_match_ratio = std::clamp(node.declare_parameter<double>("lio.kf.min_match_ratio", 0.0), 0.0, 1.0);
 
   // submaps
   node.declare_parameter<double>("lio.submap.submap_resolution", 0.0);
@@ -301,7 +305,7 @@ void ROSWrapper::setupIO(){
                  .best_effort()
                  .durability_volatile();
 
-  auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(20))
+  auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(kLidarQueueDepth))
                    .best_effort()
                    .durability_volatile();
 
@@ -359,14 +363,17 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
                  msg->angular_velocity.y,
                  msg->angular_velocity.z);
 
-  if (data.secs == last_timestamp_imu_) return;
   if (data.secs < last_timestamp_imu_) {
-    LOG(WARNING) << "imu loop back, clear buffer";
+    LOG_EVERY_N(WARNING, 200) << "Ignoring an out-of-order IMU sample";
+  }
+  if (data.secs <= last_timestamp_imu_ || !data.acc.allFinite() || !data.gyr.allFinite()) return;
+
+  const double gap = data.secs - last_timestamp_imu_;
+  if (g_imu_max_gap > 0.0 && last_timestamp_imu_ >= 0.0 && gap > g_imu_max_gap) {
+    LOG(WARNING) << "IMU gap of " << gap << " s. Discarding scans that cross the gap";
     imu_buffer_.clear();
-    imu_buffer_.push_back(data);
-    last_timestamp_imu_ = data.secs;
-    // eskf_->Reset();   // todo:
-    return;
+    imu_resume_time_ = data.secs;
+    if (eskf_->init_) eskf_->RestartPropagation(data);
   }
 
   imu_buffer_.push_back(data);
@@ -444,6 +451,7 @@ void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
   }
   lidar_data.start_time = stampToSec(msg->header.stamp);
   lidar_data.end_time   = stampToSec(msg->header.stamp, last->offset_time);
+  if (lidar_data.pc->empty()) return;
   lidar_buffer_.push_back(lidar_data);
 }
 
@@ -537,25 +545,21 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
 
 
 bool ROSWrapper::sync_measure(MeasureGroup& meas){
-  if (lidar_buffer_.empty() || imu_buffer_.empty()) {
-    return false;
-  }
+  while (lidar_buffer_.size() > kLidarQueueDepth) lidar_buffer_.pop_front();
+  if (imu_buffer_.empty()) return false;
 
-  if (!lidar_pushed_) {
-    meas.lidar = lidar_buffer_.front();
-    lidar_pushed_ = true;
-  }
-
-  const double end = meas.lidar.end_time;
-  if(last_timestamp_lidar_ >= end || imu_buffer_.front().secs > end){
+  while (!lidar_buffer_.empty()) {
+    const auto& lidar = lidar_buffer_.front();
+    if (lidar.start_time >= imu_resume_time_ && lidar.end_time > last_timestamp_lidar_ &&
+        lidar.end_time >= imu_buffer_.front().secs) break;
     lidar_buffer_.pop_front();
-    lidar_pushed_ = false;
-    return false;
   }
+  if (lidar_buffer_.empty()) return false;
 
-  if (last_timestamp_imu_ < end) {
-    return false;
-  }
+  const double end = lidar_buffer_.front().end_time;
+  if (last_timestamp_imu_ < end) return false;
+  meas.lidar = std::move(lidar_buffer_.front());
+  lidar_buffer_.pop_front();
 
   meas.imu.clear();
   // Keep the last raw sample on the left for scans sharing an IMU interval.
@@ -576,9 +580,7 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
     meas.imu_end.secs = end;
   }
 
-  last_timestamp_lidar_ = meas.lidar.end_time;
-  lidar_buffer_.pop_front();
-  lidar_pushed_ = false;
+  last_timestamp_lidar_ = end;
   return true;
 }
 

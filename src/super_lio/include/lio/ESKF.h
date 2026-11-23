@@ -76,6 +76,7 @@ public:
   void SetObsTime(const double obs_time) { current_obs_time_ = obs_time; }
   void SetLastObsTime(const double obs_time) { last_obs_time_ = obs_time; }
   void SetImuAnchor(const IMUData& imu);
+  void RestartPropagation(const IMUData& imu);
 
   void SetX(const SysState& x);
 
@@ -117,6 +118,7 @@ private:
   Options options_;
 
   double  forward_time_ = -1;
+  double last_lidar_fix_time_ = -1;
   IMUData forward_last_imu_;
   BASIC::SO3 fw_R_;
   BASIC::V3 fw_p_ = BASIC::V3::Zero();

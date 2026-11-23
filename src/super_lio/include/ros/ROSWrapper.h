@@ -60,9 +60,9 @@ public:
   void clear(){
     lidar_buffer_.clear();
     imu_buffer_.clear();
-    lidar_pushed_ = false;
     last_timestamp_imu_ = -1.0;
     last_timestamp_lidar_ = -1.0;
+    imu_resume_time_ = -1.0;
   }
 
   void pub_odom(const NavState&);
@@ -100,9 +100,9 @@ private:
 
   std::deque<IMUData>   imu_buffer_;
   std::deque<LidarData> lidar_buffer_;
-  bool lidar_pushed_ = false;
   double last_timestamp_imu_ = -1.0;
   double last_timestamp_lidar_ = -1.0;
+  double imu_resume_time_ = -1.0;
 
   ESKF::Ptr eskf_{nullptr};
 

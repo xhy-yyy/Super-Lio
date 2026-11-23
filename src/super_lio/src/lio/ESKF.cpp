@@ -1,9 +1,12 @@
 #include "lio/ESKF.h"
 
+#include <algorithm>
+
 using namespace BASIC;
 
 namespace LI2Sup{
 
+static constexpr double kMaxImuOnlyTime = 0.5;
 
 /// [1] SEfB: P195：（7.37a） P203: (7.76a) (7.77a)  P220: Table 7-2 
 /// [2] VSLAM14: P71: (4.26)  P73: (4.32)
@@ -101,8 +104,37 @@ void ESKF::SetImuAnchor(const IMUData& imu) {
   last_imu_time_ = imu.secs;
   current_time_ = imu.secs;
   SetLastObsTime(imu.secs);
+  fw_R_ = R_;
+  fw_p_ = p_;
+  fw_v_ = v_;
   forward_last_imu_ = imu;
   forward_time_ = imu.secs;
+  if (!init_) last_lidar_fix_time_ = imu.secs;
+}
+
+void ESKF::RestartPropagation(const IMUData& imu) {
+  const double gap = imu.secs - current_time_;
+  const double dt = std::clamp(gap, 0.0, kMaxImuOnlyTime);
+  p_ += v_ * dt;
+  if (gap > kMaxImuOnlyTime) {
+    v_.setZero();
+  } else {
+    const V3 gyro = 0.5 * (last_imu_.gyr + imu.gyr) - bg_;
+    const SO3 end_rotation = R_ * SO3::Exp(gyro, dt);
+    const V3 acc_start = R_.R() * (imu_scale_ * last_imu_.acc - ba_);
+    const V3 acc_end = end_rotation.R() * (imu_scale_ * imu.acc - ba_);
+    const V3 acc = 0.5 * (acc_start + acc_end) + g_;
+    p_ += 0.5 * acc * dt * dt;
+    v_ += acc * dt;
+    R_ = end_rotation;
+  }
+
+  const double uncertainty = dt * dt;
+  P_.diagonal().template segment<3>(0).array() += 0.09 * uncertainty;
+  P_.diagonal().template segment<3>(3).array() += uncertainty;
+  P_.diagonal().template segment<3>(6).array() += 4.0 * uncertainty;
+  SetImuAnchor(imu);
+  last_lidar_fix_time_ = -1;
 }
 
 
@@ -134,17 +166,12 @@ void ESKF::Update() {
 
   g_ += dx_.template block<3, 1>(15, 0);
   g_ = g_gravity_norm * (g_.normalized());
-
-  fw_R_ = R_;
-  fw_p_ = p_;
-  fw_v_ = v_;
-  forward_time_ = current_obs_time_;
-  forward_last_imu_ = last_imu_;
 }
 
 
 bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& state_robot){
-  if(!init_) {
+  if (!init_ || last_lidar_fix_time_ < 0.0 ||
+      (g_min_match_ratio > 0.0 && imu.secs - last_lidar_fix_time_ > kMaxImuOnlyTime)) {
     return false;
   }
 
@@ -277,6 +304,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   M18 K_x = M18::Zero();
 
   need_converge_ = false;
+  bool accepted = options_.num_iterations_ > 0;
 
   for (int iter = 0; iter < options_.num_iterations_; ++iter) {
     if (iter > 2) {
@@ -284,6 +312,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     }
 
     obs(GetKFState(), HTVH, HTVr);
+    if (!HTVH.allFinite() || !HTVr.allFinite() || HTVH.trace() <= 0.0) {
+      accepted = false;
+      break;
+    }
 
     V18 dx_prior = V18::Zero();
     dx_prior.template block<3,1>(0,0)  = (R_pred.inverse() * R_).log_vee();
@@ -319,12 +351,28 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
     // dx = K_h + (K_x - I) * dx_prior
     dx_ = Qk * b + (K_x - M18::Identity()) * dx_prior;
+    if (!dx_.allFinite() || !Qk.allFinite()) {
+      accepted = false;
+      break;
+    }
 
     Update();
 
     if (dx_.lpNorm<Eigen::Infinity>() < options_.quit_eps_ && iter > 0) {
       break;
     }
+  }
+
+  if (!accepted) {
+    R_ = R_pred;
+    p_ = p_pred;
+    v_ = v_pred;
+    bg_ = bg_pred;
+    ba_ = ba_pred;
+    g_ = g_pred;
+    dx_.setZero();
+    SetImuAnchor(last_imu_);
+    return false;
   }
 
   P_ = Qk;
@@ -341,7 +389,8 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   dx_.setZero();
 
-  last_obs_time_ = current_obs_time_;
+  SetImuAnchor(last_imu_);
+  last_lidar_fix_time_ = current_time_;
   return true;
 }
 
