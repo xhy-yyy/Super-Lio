@@ -12,7 +12,7 @@
 
 ## 安装与编译
 
-以下命令适用于 **Ubuntu 22.04 / ROS 2 Humble**。先安装并编译 [Livox ROS Driver 2](https://github.com/Livox-SDK/livox_ros_driver2)，使当前终端能够找到 `livox_ros_driver2` 消息包。
+以下命令适用于 **Ubuntu 22.04 / ROS 2 Humble**。先按配套驱动仓库的说明编译并加载 `ws_livox`，使当前终端能够找到 `livox_ros_driver2` 消息包。[ws_livox 安装与构建](https://github.com/xhy-yyy/ws_livox/blob/main/README.md#安装与构建)
 
 ```bash
 sudo apt install build-essential python3-colcon-common-extensions \
@@ -21,7 +21,7 @@ sudo apt install build-essential python3-colcon-common-extensions \
 
 source /opt/ros/humble/setup.bash
 # 路径按 Livox 驱动工作区的位置调整
-source ~/ws_livox_release/install/local_setup.bash
+source ~/ws_livox/install/setup.bash
 
 mkdir -p ~/ws_super/src
 git clone git@github.com:xhy-yyy/Super-Lio.git ~/ws_super/src/Super-Lio
