@@ -84,7 +84,7 @@ void ESKF::SetInitialConditions(Options options, const V3& init_bg,
 
 
 void ESKF::SetX(const SysState& x) {
-  last_imu_time_ = x.timestamp;      // TODO: The timestamp update is not strictly consistent.
+  last_imu_time_ = x.timestamp;
   current_time_ = last_imu_time_;
   R_ = x.R;
   p_ = x.p;
@@ -94,6 +94,15 @@ void ESKF::SetX(const SysState& x) {
   fw_R_ = R_;
   fw_p_ = p_;
   fw_v_ = v_;
+}
+
+void ESKF::SetImuAnchor(const IMUData& imu) {
+  last_imu_ = imu;
+  last_imu_time_ = imu.secs;
+  current_time_ = imu.secs;
+  SetLastObsTime(imu.secs);
+  forward_last_imu_ = imu;
+  forward_time_ = imu.secs;
 }
 
 
@@ -130,6 +139,7 @@ void ESKF::Update() {
   fw_p_ = p_;
   fw_v_ = v_;
   forward_time_ = current_obs_time_;
+  forward_last_imu_ = last_imu_;
 }
 
 

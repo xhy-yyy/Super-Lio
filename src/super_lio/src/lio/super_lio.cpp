@@ -1,6 +1,7 @@
 
 #include "lio/super_lio.h"
 
+#include <algorithm>
 #include <sys/resource.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -98,6 +99,7 @@ void SuperLIO::stateWaitKFInit()
 void SuperLIO::stateWaitMapInit()
 {
   if (map_init()) {
+    kf_->SetImuAnchor(measures_.imu_end);
     kf_->init_ = true;
     state_fn_ = &SuperLIO::stateProcess;
     LOG(INFO) << GREEN << " ---> [SuperLIO]: Map init done" << RESET;
@@ -180,7 +182,6 @@ bool SuperLIO::map_init(){
   );
 
   ivox_->insert(points_world_v3_);
-  kf_->SetLastObsTime(measures_.lidar.end_time);
 
   // 20 Hz for 1.0 seconds. Integral coverage area > 70%
   if(frame_num_ > 3){
@@ -362,10 +363,17 @@ void SuperLIO::Propagation_Undistort(){
   propagate_states_.clear();
   propagate_states_.emplace_back(kf_->GetDynamicState());
   kf_->SetObsTime(measures_.lidar.end_time);
-  for (auto &imu : measures_.imu) {
-    kf_->Predict(imu);
+  for (const auto& imu : measures_.imu) {
+    if (kf_->Predict(imu)) {
+      propagate_states_.emplace_back(kf_->GetDynamicState());
+    }
+  }
+  if (kf_->GetTime() < measures_.imu_end.secs && kf_->Predict(measures_.imu_end)) {
     propagate_states_.emplace_back(kf_->GetDynamicState());
   }
+  std::vector<Quat> rotations;
+  rotations.reserve(propagate_states_.size());
+  for (const auto& state : propagate_states_) rotations.emplace_back(state.R);
 
   static const M3 TLI_R = g_lidar_imu.R_;
   static const V3 TLI_t = g_lidar_imu.t_;
@@ -381,43 +389,23 @@ void SuperLIO::Propagation_Undistort(){
   tbb::parallel_for(
   tbb::blocked_range<size_t>(0, ptsize),
   [&](const tbb::blocked_range<size_t>& r) {
-    M3 R_h, R_t; V3 p_h, v_h, acc_t, w_t;
     for (size_t idx = r.begin(); idx < r.end(); ++idx) {  
       auto& pt_full = scan_undistort_full_->points[idx];
       const auto& pt = raw_pc->points[idx];
       pt_full.intensity = pt.intensity;
-      double query_time = start_time + pt.offset_time;
-      if (query_time > propagate_states_.back().time) {
-        V3 raw(pt.x, pt.y, pt.z);
-        V3 eigen_point = TLI_R * raw + TLI_t;
-        pt_full.x = eigen_point[0];
-        pt_full.y = eigen_point[1];
-        pt_full.z = eigen_point[2];
-        continue;
+      const double query_time = start_time + pt.offset_time;
+      V3 eigen_point = TLI_R * V3(pt.x, pt.y, pt.z) + TLI_t;
+      if (query_time < propagate_states_.back().time && propagate_states_.size() > 1) {
+        const auto tail = std::lower_bound(propagate_states_.begin() + 1, propagate_states_.end(),
+            query_time, [](const DynamicState& state, double time) { return state.time < time; });
+        const auto& head = *std::prev(tail);
+        const double tau = std::max(0.0, query_time - head.time);
+        const double s = tau / (tail->time - head.time);
+        const auto i = tail - propagate_states_.begin();
+        const M3 R_i = rotations[i - 1].slerp(s, rotations[i]).toRotationMatrix();
+        const V3 p_i = head.p + head.v * tau + 0.5 * tail->a * tau * tau;
+        eigen_point = R_inv * (R_i * eigen_point + (p_i - T_end_t));
       }
-      auto match_iter = propagate_states_.begin();
-      for (auto iter = propagate_states_.begin(); iter != propagate_states_.end(); ++iter) {
-        auto next_iter = std::next(iter);
-        if (iter->time < query_time && next_iter->time >= query_time) {
-          match_iter = iter;
-          break;
-        }
-      }
-      auto match_iter_n = std::next(match_iter);
-      double dt = match_iter_n->time - match_iter->time;
-      double tau = query_time - match_iter->time;
-      double s   = tau / dt;
-      R_h = match_iter->R;
-      R_t = match_iter_n->R;
-      p_h = match_iter->p;
-      v_h = match_iter->v;
-      acc_t = match_iter_n->a;
-      w_t = match_iter_n->w;
-      M3 R_i = Quat(R_h).slerp(s, Quat(R_t)).toRotationMatrix();
-      V3 p_i = p_h + v_h * tau + 0.5 * acc_t * tau * tau;
-      V3 t_ei = p_i - T_end_t;
-      V3 raw(pt.x, pt.y, pt.z);
-      V3 eigen_point = R_inv * (R_i * (TLI_R * raw + TLI_t) + t_ei);
       pt_full.x = eigen_point[0];
       pt_full.y = eigen_point[1];
       pt_full.z = eigen_point[2];
@@ -441,6 +429,7 @@ struct ThreadACC{
 
 void SuperLIO::Observe(){
   size_t ptsize = ds_undistort_->size();
+  const double huber_delta = g_plane_huber_delta;
   
   static std::vector<float> _lengths;
   points_body_v3_.resize(ptsize);
@@ -502,8 +491,12 @@ void SuperLIO::Observe(){
             J.head<3>() = point_body_d.cross(nb);
             J.tail<3>() = normvec;
       
-            local_acc.HTVH += J * 1000 * J.transpose();
-            local_acc.HTVr -= J * 1000 * error;
+            constexpr double information = 1000.0;
+            const double distance = std::abs(static_cast<double>(error));
+            const double weight = huber_delta > 0.0 && distance > huber_delta
+                ? information * huber_delta / distance : information;
+            local_acc.HTVH += (weight * J) * J.transpose();
+            local_acc.HTVr -= (weight * error) * J;
           }
         }
     });

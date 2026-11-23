@@ -68,6 +68,7 @@ namespace LI2Sup{
   extern int g_kf_max_iterations;
   extern bool g_kf_align_gravity;
   extern double g_kf_quit_eps;
+  extern double g_plane_huber_delta;
 
   /// submaps
   extern double g_submap_resolution;

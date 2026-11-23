@@ -2,6 +2,7 @@
 #include "ros/ROSWrapper.h"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 
+#include <algorithm>
 
 using namespace BASIC;
 
@@ -141,6 +142,7 @@ void LoadParamFromRos(rclcpp::Node& node)
 
   node.declare_parameter<double>("lio.kf.kf_quit_eps", 0.0);
   node.get_parameter("lio.kf.kf_quit_eps", g_kf_quit_eps);
+  g_plane_huber_delta = node.declare_parameter<double>("lio.kf.plane_huber_delta", 0.0);
 
   // submaps
   node.declare_parameter<double>("lio.submap.submap_resolution", 0.0);
@@ -254,18 +256,21 @@ inline bool validPoint(double x, double y, double z)
 }
 
 
-inline double stampToSec(const builtin_interfaces::msg::Time& t)
+inline double stampToSec(const builtin_interfaces::msg::Time& t, uint32_t offset_ns = 0)
 {
-  return static_cast<double>(t.sec) +
-         static_cast<double>(t.nanosec) * 1e-9;
+  const int64_t nanos = static_cast<int64_t>(t.nanosec) + offset_ns;
+  return static_cast<double>(t.sec + nanos / 1'000'000'000) +
+         static_cast<double>(nanos % 1'000'000'000) * 1e-9;
 }
 
 
 inline builtin_interfaces::msg::Time toRosTime(double t_sec)
 {
   builtin_interfaces::msg::Time t;
-  t.sec = static_cast<int32_t>(std::floor(t_sec));
-  t.nanosec = static_cast<uint32_t>((t_sec - t.sec) * 1e9);
+  const double seconds = std::floor(t_sec);
+  const int64_t nanos = std::llround((t_sec - seconds) * 1e9);
+  t.sec = static_cast<int32_t>(seconds + nanos / 1'000'000'000);
+  t.nanosec = static_cast<uint32_t>(nanos % 1'000'000'000);
   return t;
 }
 
@@ -354,6 +359,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
                  msg->angular_velocity.y,
                  msg->angular_velocity.z);
 
+  if (data.secs == last_timestamp_imu_) return;
   if (data.secs < last_timestamp_imu_) {
     LOG(WARNING) << "imu loop back, clear buffer";
     imu_buffer_.clear();
@@ -417,26 +423,27 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
 
 
 void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg){
-  if(msg->point_num < 10) return;
+  const auto ptsize = std::min<std::size_t>(msg->point_num, msg->points.size());
+  if(ptsize < 10) return;
   LidarData lidar_data;
-  std::size_t ptsize = msg->point_num;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
   lidar_data.pc->reserve(ptsize / g_filter_rate + 1);
 
-  double offset_time = 0.0;
+  const auto last = std::max_element(msg->points.begin(), msg->points.begin() + ptsize,
+      [](const auto& a, const auto& b) { return a.offset_time < b.offset_time; });
   for(std::size_t _i = 0; _i < ptsize; _i += g_filter_rate){
     auto& pt = msg->points[_i];
     auto tag = pt.tag & 0x30;
     if (tag == 0x10 || tag == 0x00){
       auto dis = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
       if(dis > g_blind2 && dis < g_maxrange2){
-        offset_time = pt.offset_time * 1e-9;
+        const double offset_time = pt.offset_time * 1e-9;
         lidar_data.pc->emplace_back(pt.x, pt.y, pt.z, pt.reflectivity, offset_time);
       }
     }
   }
   lidar_data.start_time = stampToSec(msg->header.stamp);
-  lidar_data.end_time   = lidar_data.start_time + offset_time;
+  lidar_data.end_time   = stampToSec(msg->header.stamp, last->offset_time);
   lidar_buffer_.push_back(lidar_data);
 }
 
@@ -539,23 +546,34 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
     lidar_pushed_ = true;
   }
 
-  if(last_timestamp_lidar_ > meas.lidar.end_time){
+  const double end = meas.lidar.end_time;
+  if(last_timestamp_lidar_ >= end || imu_buffer_.front().secs > end){
     lidar_buffer_.pop_front();
     lidar_pushed_ = false;
     return false;
   }
 
-  if (last_timestamp_imu_ < meas.lidar.end_time) {
+  if (last_timestamp_imu_ < end) {
     return false;
   }
 
-  double imu_time = imu_buffer_.front().secs;
   meas.imu.clear();
-  while ((!imu_buffer_.empty()) && (imu_time < meas.lidar.end_time)) {
-    imu_time = imu_buffer_.front().secs;
-    if (imu_time > meas.lidar.end_time) break;
-    meas.imu.push_back(imu_buffer_.front());
+  // Keep the last raw sample on the left for scans sharing an IMU interval.
+  while (imu_buffer_.size() > 1 && imu_buffer_[1].secs <= end) {
+    if (imu_buffer_.front().secs > last_timestamp_lidar_) {
+      meas.imu.push_back(imu_buffer_.front());
+    }
     imu_buffer_.pop_front();
+  }
+  const auto& left = imu_buffer_.front();
+  if (left.secs > last_timestamp_lidar_) meas.imu.push_back(left);
+  meas.imu_end = left;
+  if (left.secs < end) {
+    const auto& right = imu_buffer_[1];
+    const double fraction = (end - left.secs) / (right.secs - left.secs);
+    meas.imu_end.acc += fraction * (right.acc - left.acc);
+    meas.imu_end.gyr += fraction * (right.gyr - left.gyr);
+    meas.imu_end.secs = end;
   }
 
   last_timestamp_lidar_ = meas.lidar.end_time;

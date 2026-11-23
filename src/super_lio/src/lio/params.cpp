@@ -51,6 +51,7 @@ namespace LI2Sup{
   int g_kf_max_iterations = 4;
   bool g_kf_align_gravity = true;
   double g_kf_quit_eps;
+  double g_plane_huber_delta = 0.0;
 
   /// submap 
   double g_submap_resolution;

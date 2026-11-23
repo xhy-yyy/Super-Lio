@@ -130,6 +130,7 @@ struct LidarData
 struct MeasureGroup {
   LidarData lidar;
   std::deque<IMUData> imu;
+  IMUData imu_end;
 };
 
 

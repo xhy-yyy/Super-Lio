@@ -1,140 +1,78 @@
-<div align="center">
-  <h1>⚡Super-LIO</h1>
-  <h2>Super-LIO: A Robust and Efficient LiDAR-Inertial Odometry System with a Compact Mapping Strategy</h2>
-  <p><strong>This work has been accepted to <i> IEEE Robotics and Automation Letters (RA-L 2026)</i>.</strong></p>
-  <br>
+# Super-Lio
 
-  [![Code](https://img.shields.io/badge/GitHub-181717?style=flat-square&logo=github&logoWidth=16)](https://github.com/Liansheng-Wang/Super-LIO.git) [![arXiv](https://img.shields.io/badge/arXiv-blue?logo=arxiv&color=%23B31B1B)](https://arxiv.org/abs/2509.05723) [![IEEE](https://img.shields.io/badge/RAL2026-004088.svg)](https://ieeexplore.ieee.org/document/11347459) [![Bilibili](https://img.shields.io/badge/Bilibili-00A1D6?style=flat-square&logo=bilibili&logoColor=white&logoWidth=16)](https://www.bilibili.com/video/BV11wBeBYEp6) [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=flat-square&logo=youtube&logoColor=white&logoWidth=16)](https://youtu.be/m9-hl8s5DDw)
-</div>
+面向 Livox MID360 的 ROS 2 激光惯性里程计。基于上游 Super-LIO 的 `ros2` 分支，使用 MID360 点云和内置 IMU 估计位姿、输出去畸变点云。适用于希望在有限算力下运行定位和建图的设备。
 
+## 改进内容
 
-<div align="center">
-  <p>
-    <a href="https://github.com/Liansheng-Wang/Super-LIO/tree/ros1" style="text-decoration: none;">
-      <img src="https://img.shields.io/badge/🔄 SWITCH - ROS1 Noetic-3b82f6?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22" alt="Switch to ROS1"
-      onmouseover="this.src='https://img.shields.io/badge/🔄 SWITCH - ROS1 Noetic-1e40af?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"
-      onmouseout="this.src='https://img.shields.io/badge/🔄 SWITCH - ROS1 Noetic-3b82f6?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"/>
-    </a>&nbsp;&nbsp;
-    <a href="https://github.com/Liansheng-Wang/Super-LIO/tree/ros2" style="text-decoration: none;">
-      <img src="https://img.shields.io/badge/✅ ACTIVE - ROS2 Humble/Iron/Jazzy-22c55e?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22" alt="ROS2 Active"
-      onmouseover="this.src='https://img.shields.io/badge/✅ ACTIVE - ROS2 Humble/Iron/Jazzy-166534?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"
-      onmouseout="this.src='https://img.shields.io/badge/✅ ACTIVE - ROS2 Humble/Iron/Jazzy-22c55e?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"/>
-    </a>&nbsp;&nbsp;
-    <a href="#" style="text-decoration: none; cursor: default;">
-      <img src="https://img.shields.io/badge/🖥️ PLATFORM - X86 + ARM64-8b5cf6?style=for-the-badge&logo=linux&logoColor=white&logoWidth=22" alt="X86 and ARM Support"
-      onmouseover="this.src='https://img.shields.io/badge/🖥️ PLATFORM - X86_64 + ARM64-4f46e5?style=for-the-badge&logo=linux&logoColor=white&logoWidth=22'"
-      onmouseout="this.src='https://img.shields.io/badge/🖥️ PLATFORM - X86_64 + ARM64-8b5cf6?style=for-the-badge&logo=linux&logoColor=white&logoWidth=22'"/>
-    </a>
-  </p>
-</div>
+- **以原始点包确定扫描结束时刻。** 使用点包中最大的逐点时间偏移，避免抽样、盲区过滤和距离过滤改变扫描的结束时间。
+- **把 IMU 状态传播到扫描末端。** 用帧末两侧的 IMU 样本插值，将传播和去畸变对齐到同一时刻。融合位姿与世界系点云使用同一个时间戳。
+- **降低大残差点对配准的影响。** MID360 配置默认启用 Huber 降权。点到平面距离超过 **0.05 m** 后，观测权重随距离增大而降低，减轻墙角、柱边等处不可靠匹配对位姿的拉偏。
 
-## Overview
+上述改动沿用 Super-LIO 的 OctVoxMap、点云抽样和迭代滤波框架。
 
-<p align="center">
-  <img src="docs/system_overview.png" width="95%">
-</p>
+## 安装与编译
 
-**Key Features:  Efficient · Robust · Cross-Platform Compatible · Supports Both ROS1/ROS2 Versions**
-
-Super-LIO is a robust and efficient LiDAR–Inertial Odometry (LIO) system designed for real-time and large-scale autonomous navigation. It introduces a compact and structured mapping strategy that enables predictable correspondence search and stable state estimation. The system is validated through extensive real-world experiments and comparisons with state-of-the-art methods, which demonstrates that Super-LIO not only achieves **excellent accuracy** but also maintains **lower resource consumption** and realizes a nearly **1.2–4× higher real-time processing speed**⚡.
-
-
-**Contributors**: [Liansheng Wang](https://github.com/Liansheng-Wang), [Xinke Zhang](https://github.com/PSQzzzxk), [Chenhui Li](https://github.com/kermitLHH), [Dongjiao He](https://github.com/Joanna-HE), [Yihan pan](https://github.com/pyh3552), Jianjun Yi.
-
-
-## Quickly Run
-
-**For ROS1 Users**: Please switch to the **ros1** branch and follow the instructions at [ros1 branch](https://github.com/Liansheng-Wang/Super-LIO/tree/ros1)
-
-### Requirements
-
-Ubuntu 24(22).04 · C++20 · ROS Jazzy(Humble) · Eigen · PCL 
-
-### Dependencies
-
-glog · TBB
+以下命令适用于 **Ubuntu 22.04 / ROS 2 Humble**。先安装并编译 [Livox ROS Driver 2](https://github.com/Livox-SDK/livox_ros_driver2)，使当前终端能够找到 `livox_ros_driver2` 消息包。
 
 ```bash
-sudo apt install libgoogle-glog-dev libtbb-dev
-```
+sudo apt install build-essential python3-colcon-common-extensions \
+  libeigen3-dev libpcl-dev libgoogle-glog-dev libtbb-dev \
+  ros-humble-pcl-ros ros-humble-pcl-conversions
 
-### Build & Run
-```bash
-git clone https://github.com/Liansheng-Wang/Super-LIO.git
-cd Super-LIO
-colcon build
+source /opt/ros/humble/setup.bash
+# 路径按 Livox 驱动工作区的位置调整
+source ~/ws_livox_release/install/local_setup.bash
 
+mkdir -p ~/ws_super/src
+git clone git@github.com:xhy-yyy/Super-Lio.git ~/ws_super/src/Super-Lio
+cd ~/ws_super
+colcon build --executor sequential --packages-up-to super_lio
 source install/setup.bash
-ros2 launch super_lio Livox_mid360.py
-
 ```
 
-#### 🔁 Relocalization Mode
-Super-LIO supports relocalization using a pre-built map, allowing the system to resume localization from a saved map without restarting the mapping process.
-This mode is useful for long-term deployment, repeated missions, or recovery after tracking loss.
+在 Jetson Orin NX 上部署时，在目标设备上编译源码。首次初始化期间保持雷达静止，让内置 IMU 估计重力方向和陀螺零偏。
 
-Before running relocalization, please make sure that:
-- A map has been previously saved to disk.
+## 启动 MID360
+
+在单独的终端启动 Livox 驱动。使用 `msg_MID360_launch.py`，配置 `xfer_format=1`，并根据实际网卡和雷达地址填写驱动的 `MID360_config.json`。
 
 ```bash
-cd PATH_2_Super-LIO
-source install/setup.bash
-ros2 launch super_lio relocation.py
+# Super-Lio 终端
+source ~/ws_super/install/setup.bash
+ros2 launch super_lio Livox_mid360.py rviz:=false
 ```
 
+需要 RViz 时将 `rviz` 改为 `true`。仅回放或单独运行里程计时，可用下面的入口关闭额外的 MAVROS 视觉位姿发布。
 
-## Datasets
-<p align="center">
-  <img src="docs/datasets_compressed.png" width="95%">
-</p>
-
-Super-LIO is evaluated on multiple real-world datasets covering diverse environments,
-including indoor, outdoor, and large-scale scenes.
-
-> **TODO**: Dataset download links and detailed descriptions will be provided in the future.
-
-
----
-
-## Publications
-
-If your like our projects, please cite us and support us with a star 🌟.
-We kindly recommend to cite [our paper](https://ieeexplore.ieee.org/document/11347459) if you find this library useful:
-
-```latex
-@article{wang2026superlio,
-  title   = {Super-LIO: A Robust and Efficient LiDAR-Inertial Odometry System with a Compact Mapping Strategy},
-  author  = {Wang, Liansheng and Zhang, Xinke and Li, Chenhui and He, Dongjiao and Pan, Yihan and Yi, Jianjun},
-  journal = {IEEE Robotics and Automation Letters},
-  year    = {2026},
-  volume  = {11},
-  number  = {3},
-  pages   = {2666--2673},
-  doi     = {10.1109/LRA.2026.3653372}
-}
+```bash
+source ~/ws_super/install/setup.bash
+super_config="$(ros2 pkg prefix --share super_lio)/config/livox_360.yaml"
+ros2 run super_lio super_lio_node --ros-args \
+  --params-file "$super_config" -p lio.output.robot:=false
 ```
 
+### 话题
 
-## Update Logs
+| 方向 | 话题 | 用途 |
+| --- | --- | --- |
+| 输入 | `/livox/lidar` | `livox_ros_driver2/msg/CustomMsg`，包含逐点时间偏移 |
+| 输入 | `/livox/imu` | `sensor_msgs/msg/Imu`，来自 MID360 内置 IMU |
+| 输出 | `/lio/odom` | 世界系下的 IMU 位姿，按点云帧更新 |
+| 输出 | `/lio/imu/odom` | 世界系下的 IMU 前向传播位姿，按有效 IMU 样本更新 |
+| 输出 | `/lio/robo/odom` | 通过 `lio.extrinsic.odom_robo` 转换的机器人位姿 |
+| 输出 | `/lio/cloud_world` | 已去畸变、已变换到 `world` 坐标系的点云 |
 
-<details>
-<summary>Click to expand <b>Update Logs</b> (click to collapse)</summary>
+### 常用配置
 
-<br>
+在 [`livox_360.yaml`](src/super_lio/config/livox_360.yaml) 中调整参数。修改源码目录中的 YAML 后，重新构建以更新安装目录中的启动配置。
 
-- 2026-01-04  
-  - Separate ROS interface and algorithm.
-  - Refactor SuperLIOReLoc to inherit from SuperLIO.
-  - Code style aligned with ROS2 version.
+| 参数 | 默认值 | 用途 |
+| --- | --- | --- |
+| `lio.kf.plane_huber_delta` | `0.05` | 点面残差开始降权的距离，单位为米。设为 `0.0` 可关闭 |
+| `lio.ros.lidar_topic` / `lio.ros.imu_topic` | `/livox/lidar` / `/livox/imu` | 驱动输出话题 |
+| `lio.output.robot` | `true` | 向 `/mavros/vision_pose/pose` 额外发布机器人位姿 |
+| `lio.output.map` | `true` | 发布世界系点云 |
 
-- 2026-01-04
-  - The main branch is renamed to ros1
-  - add ros2 branch
+## 上游与许可证
 
-- 2026-01-04 21:51
-  - release ROS2 version
-
-- 2026-06-07
- - [Important revisions]: Fixed some known errors and improved algorithm accuracy!
- 
-</details>
+本项目基于 Liansheng Wang 等人的 Super-LIO ROS 2 实现，基线提交为 `f89f48d`。算法和 OctVoxMap 的引用见原论文 *Super-LIO: A Robust and Efficient LiDAR-Inertial Odometry System with a Compact Mapping Strategy*，IEEE Robotics and Automation Letters, 2026。[上游源码](https://github.com/Liansheng-Wang/Super-LIO/tree/f89f48dc7aea6cfa262f18e4d03b319e04e0dbd2) · [论文](https://doi.org/10.1109/LRA.2026.3653372) · [GPL-3.0 许可证](LICENSE)

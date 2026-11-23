@@ -75,6 +75,7 @@ public:
 
   void SetObsTime(const double obs_time) { current_obs_time_ = obs_time; }
   void SetLastObsTime(const double obs_time) { last_obs_time_ = obs_time; }
+  void SetImuAnchor(const IMUData& imu);
 
   void SetX(const SysState& x);
 
