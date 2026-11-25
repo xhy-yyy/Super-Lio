@@ -79,8 +79,8 @@ void SuperLIOReLoc::init(){
   init_obs_data_.reset(new PointCloudType());
   
   points_world_v3_.reserve(21000);
-  abcd_vec_.resize(20000);
-  effect_knn_idxs_.resize(20000);
+  abcd_vec_.reserve(20000);
+  effect_knn_idxs_.reserve(20000);
   voxel_grid_fliter_.setLeafSize(g_voxel_fliter_size);
 
   LOG(INFO) << GREEN << " ---> [SuperLIO]: initialized." << RESET;
@@ -305,8 +305,6 @@ void SuperLIOReLoc::Output() {
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
   transformation.block<3, 1>(0, 3) = state.p.cast<float>();
 
-  CloudPtr world_pc(new PointCloudType());
-  
   if(g_visual_map){
     static int count = -1;
     count++;
@@ -315,11 +313,11 @@ void SuperLIOReLoc::Output() {
     }
     count = 0;
     if(g_visual_dense){
-      pcl::transformPointCloud(*scan_undistort_full_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
+      pcl::transformPointCloud(*scan_undistort_full_, *ds_world_, transformation);
+      data_wrapper_->pub_cloud_world(ds_world_, state.timestamp);
     }else{
-      pcl::transformPointCloud(*ds_undistort_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
+      pcl::transformPointCloud(*ds_undistort_, *ds_world_, transformation);
+      data_wrapper_->pub_cloud_world(ds_world_, state.timestamp);
     }
   }
 

@@ -9,6 +9,10 @@ using namespace BASIC;
 namespace LI2Sup{
 
 static constexpr std::size_t kLidarQueueDepth = 20;
+static constexpr std::size_t kImuQueueDepth = 500;
+static constexpr double kImuHistorySeconds = 1.0;
+static constexpr std::size_t kPathHistorySize = 2000;
+static constexpr double kPathPublishPeriod = 0.2;
 
 void LoadParamFromRos(rclcpp::Node& node)
 {
@@ -55,8 +59,11 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.get_parameter("lio.sensor.maxrange", temp_range_dis);
   g_maxrange2 = temp_range_dis * temp_range_dis;
 
-  node.declare_parameter<int>("lio.sensor.filter_rate", 1);
-  node.get_parameter("lio.sensor.filter_rate", g_filter_rate);
+  g_filter_rate = node.declare_parameter<int>("lio.sensor.filter_rate", 1);
+  if (g_filter_rate < 1) {
+    LOG(WARNING) << "lio.sensor.filter_rate must be positive. Using 1.";
+    g_filter_rate = 1;
+  }
 
   node.declare_parameter<bool>("lio.sensor.enable_downsample", false);
   node.get_parameter("lio.sensor.enable_downsample", g_enable_downsample);
@@ -177,8 +184,11 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<bool>("lio.output.dense", false);
   node.get_parameter("lio.output.dense", g_visual_dense);
 
-  node.declare_parameter<int>("lio.output.pub_step", 0);
-  node.get_parameter("lio.output.pub_step", g_pub_step);
+  g_pub_step = node.declare_parameter<int>("lio.output.pub_step", 1);
+  if (g_pub_step < 1) {
+    LOG(WARNING) << "lio.output.pub_step must be positive. Using 1.";
+    g_pub_step = 1;
+  }
 
   // ================= relocation =================
   node.declare_parameter<bool>("lio.relocation.update_map", false);
@@ -283,6 +293,7 @@ ROSWrapper::ROSWrapper(const rclcpp::NodeOptions& options)
 : rclcpp::Node("super_lio", options)
 {
   LoadParamFromRos(*this);
+  max_scan_age_ = declare_parameter<double>("lio.output.max_scan_age", 0.0);
   LOG(INFO) << GREEN << " ---> Using Lidar type: "
             << lidarTypeToString(g_lidar_type) << RESET;
 
@@ -301,7 +312,7 @@ void ROSWrapper::setupIO(){
   rclcpp::SubscriptionOptions sub_opt;
   sub_opt.callback_group = cb_sensor_;
 
-  auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(500))
+  auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(kImuQueueDepth))
                  .best_effort()
                  .durability_volatile();
 
@@ -378,6 +389,10 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
 
   imu_buffer_.push_back(data);
   last_timestamp_imu_ = data.secs;
+  while (imu_buffer_.size() > kImuQueueDepth ||
+         data.secs - imu_buffer_.front().secs > kImuHistorySeconds) {
+    imu_buffer_.pop_front();
+  }
 
   DynamicState imu_state, robo_state;
   if(eskf_->Predict(data, imu_state, robo_state)){
@@ -548,16 +563,23 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
   while (lidar_buffer_.size() > kLidarQueueDepth) lidar_buffer_.pop_front();
   if (imu_buffer_.empty()) return false;
 
+  const double oldest_imu = imu_buffer_.front().secs;
+  const bool history_lost = eskf_->init_ && eskf_->GetTime() < oldest_imu;
+  const double earliest_scan = history_lost ? oldest_imu : imu_resume_time_;
   while (!lidar_buffer_.empty()) {
     const auto& lidar = lidar_buffer_.front();
-    if (lidar.start_time >= imu_resume_time_ && lidar.end_time > last_timestamp_lidar_ &&
-        lidar.end_time >= imu_buffer_.front().secs) break;
+    if (lidar.start_time >= earliest_scan && lidar.end_time > last_timestamp_lidar_ &&
+        lidar.end_time >= oldest_imu) break;
     lidar_buffer_.pop_front();
   }
   if (lidar_buffer_.empty()) return false;
 
   const double end = lidar_buffer_.front().end_time;
   if (last_timestamp_imu_ < end) return false;
+  if (history_lost) {
+    LOG(WARNING) << "LiDAR resumes outside the retained IMU history. Reanchoring propagation";
+    eskf_->RestartPropagation(imu_buffer_.front());
+  }
   meas.lidar = std::move(lidar_buffer_.front());
   lidar_buffer_.pop_front();
 
@@ -582,6 +604,14 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
 
   last_timestamp_lidar_ = end;
   return true;
+}
+
+bool ROSWrapper::scanFresh(double time) const {
+  return max_scan_age_ <= 0.0 || last_timestamp_imu_ - time <= max_scan_age_;
+}
+
+void ROSWrapper::replayForwardImu() {
+  eskf_->ReplayForward(imu_buffer_);
 }
 
 
@@ -626,12 +656,21 @@ void ROSWrapper::pub_odom(const NavState& state){
 
   if((last_path_point_ - robo_position).norm() > 0.1)
   {
-    path_.header.stamp = odom.header.stamp;
     geometry_msgs::msg::PoseStamped point;
+    point.header = odom.header;
     point.pose = odom.pose.pose;
-    path_.poses.push_back(point);
-    pub_path_->publish(path_);
+    path_history_.push_back(std::move(point));
+    if (path_history_.size() > kPathHistorySize) path_history_.pop_front();
     last_path_point_ = robo_position;
+    path_dirty_ = true;
+  }
+  if (path_dirty_ && (last_path_pub_time_ < 0.0 ||
+                     state.timestamp - last_path_pub_time_ >= kPathPublishPeriod)) {
+    path_.header.stamp = odom.header.stamp;
+    path_.poses.assign(path_history_.begin(), path_history_.end());
+    pub_path_->publish(path_);
+    last_path_pub_time_ = state.timestamp;
+    path_dirty_ = false;
   }
 
   geometry_msgs::msg::TransformStamped tf_msg;

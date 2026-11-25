@@ -1,6 +1,8 @@
 #ifndef ESKF_HPP_
 #define ESKF_HPP_
 
+#include <deque>
+
 #include "basic/alias.h"
 #include "basic/Manifold.h"
 #include "common/ds.h"
@@ -77,6 +79,7 @@ public:
   void SetLastObsTime(const double obs_time) { last_obs_time_ = obs_time; }
   void SetImuAnchor(const IMUData& imu);
   void RestartPropagation(const IMUData& imu);
+  void ReplayForward(const std::deque<IMUData>& samples);
 
   void SetX(const SysState& x);
 
@@ -88,6 +91,7 @@ public:
   bool Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& state_robot);
 
 private:
+  bool AdvanceForward(const IMUData& imu, BASIC::V3& acc, BASIC::V3& gyr);
   void BuildNoise(const Options& options);
   void Update();
   

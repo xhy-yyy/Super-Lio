@@ -80,8 +80,8 @@ void SuperLIO::init(){
   }
   
   points_world_v3_.reserve(21000);
-  abcd_vec_.resize(20000);
-  effect_knn_idxs_.resize(20000);
+  abcd_vec_.reserve(20000);
+  effect_knn_idxs_.reserve(20000);
   voxel_grid_fliter_.setLeafSize(g_voxel_fliter_size);
 
   state_fn_ = &SuperLIO::stateWaitKFInit;
@@ -103,6 +103,7 @@ void SuperLIO::stateWaitMapInit()
   if (map_init()) {
     kf_->SetImuAnchor(measures_.imu_end);
     kf_->init_ = true;
+    data_wrapper_->replayForwardImu();
     state_fn_ = &SuperLIO::stateProcess;
     LOG(INFO) << GREEN << " ---> [SuperLIO]: Map init done" << RESET;
   }
@@ -209,7 +210,7 @@ void SuperLIO::stateProcess(){
     if (!Observe()) return;
     UpdateMap();
   }
-  Output();
+  if (data_wrapper_->scanFresh(measures_.lidar.end_time)) Output();
   caceData();
 }
 
@@ -442,6 +443,12 @@ bool SuperLIO::Observe(){
   static std::vector<float> _lengths;
   points_body_v3_.resize(ptsize);
   _lengths.resize(ptsize);
+  if (ptsize > effect_knn_idxs_.size()) {
+    effect_knn_idxs_.resize(ptsize);
+    effect_mask_.resize(ptsize);
+    effect_knn_mask_.resize(ptsize);
+    abcd_vec_.resize(ptsize);
+  }
 
   effect_knn_num_ = ptsize;
   std::iota(effect_knn_idxs_.begin(), effect_knn_idxs_.begin() + ptsize, 0);
@@ -545,8 +552,10 @@ bool SuperLIO::Observe(){
   frame_num_++;
   if (!accepted) {
     LOG_EVERY_N(WARNING, 20) << "Skipping LiDAR scan without a reliable pose update";
+    return false;
   }
-  return accepted;
+  data_wrapper_->replayForwardImu();
+  return true;
 }
 
 
@@ -572,29 +581,20 @@ void SuperLIO::UpdateMap() {
 
 void SuperLIO::Output(){
   auto state = kf_->GetNavState();
-  data_wrapper_->pub_odom(state);  
+  data_wrapper_->pub_odom(state);
+  if (!g_visual_map) return;
+
+  static int count = -1;
+  if (++count % g_pub_step != 0) return;
+  count = 0;
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
   transformation.block<3, 1>(0, 3) = state.p.cast<float>();
 
-  CloudPtr world_pc(new PointCloudType());
-  
-  if(g_visual_map){
-    static int count = -1;
-    count++;
-    if(count % g_pub_step != 0){
-      return;
-    }
-    count = 0;
-    if(g_visual_dense){
-      pcl::transformPointCloud(*scan_undistort_full_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
-    }else{
-      pcl::transformPointCloud(*ds_undistort_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
-    }
-  }
+  const auto& cloud = g_visual_dense ? scan_undistort_full_ : ds_undistort_;
+  pcl::transformPointCloud(*cloud, *ds_world_, transformation);
+  data_wrapper_->pub_cloud_world(ds_world_, state.timestamp);
 }
 
 void SuperLIO::printTimeRecord(){

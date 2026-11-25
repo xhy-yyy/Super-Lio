@@ -3,48 +3,33 @@
 
 #include <glog/logging.h>
 #include <chrono>
-#include <fstream>
+#include <cstddef>
 #include <map>
-#include <numeric>
 #include <string>
+#include <utility>
 
 class Timer {
  public:
   struct TimerRecord {
-    TimerRecord() = default;
-    TimerRecord(const std::string& name, double time_usage) {
-      func_name_ = name;
-      time_usage_in_ms_.emplace_back(time_usage);
-    }
-    std::string func_name_;
-    std::vector<double> time_usage_in_ms_;
+    double total_ms = 0.0;
+    std::size_t count = 0;
   };
 
   template <class F>
   void Evaluate(F&& func, const std::string& func_name) {
-    auto t1 = std::chrono::high_resolution_clock::now();
+    const auto start = std::chrono::steady_clock::now();
     std::forward<F>(func)();
-    auto t2 = std::chrono::high_resolution_clock::now();
-    auto time_used =
-        std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1)
-            .count() *
-        1000;
-    if (records_.find(func_name) != records_.end()) {
-      records_[func_name].time_usage_in_ms_.emplace_back(time_used);
-    } else {
-      records_.insert({func_name, TimerRecord(func_name, time_used)});
-    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    auto& record = records_[func_name];
+    record.total_ms += std::chrono::duration<double, std::milli>(elapsed).count();
+    ++record.count;
   }
 
   void PrintAll() {
     LOG(INFO) << ">>> ===== Printing run time =====";
-    for (const auto& r : records_) {
-      double time_temp = std::accumulate(r.second.time_usage_in_ms_.begin(),
-                                        r.second.time_usage_in_ms_.end(),
-                                        0.0) /
-                        double(r.second.time_usage_in_ms_.size());
-      LOG(INFO) << "> [ " << r.first << " ] average time usage: " << time_temp
-                << " ms , called times: " << r.second.time_usage_in_ms_.size();
+    for (const auto& [name, record] : records_) {
+      LOG(INFO) << "> [ " << name << " ] average time usage: "
+                << record.total_ms / record.count << " ms , called times: " << record.count;
     }
   }
 

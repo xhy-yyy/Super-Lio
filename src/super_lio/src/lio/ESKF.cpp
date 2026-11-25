@@ -169,7 +169,7 @@ void ESKF::Update() {
 }
 
 
-bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& state_robot){
+bool ESKF::AdvanceForward(const IMUData& imu, V3& acc, V3& gyr) {
   if (!init_ || last_lidar_fix_time_ < 0.0 ||
       (g_min_match_ratio > 0.0 && imu.secs - last_lidar_fix_time_ > kMaxImuOnlyTime)) {
     return false;
@@ -184,15 +184,15 @@ bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& st
 
   double dt = imu.secs - forward_time_;
 
-  if(dt < 0 || dt > 0.2){
+  if (dt <= 0.0 || dt > 0.2) {
     return false;
   }
 
-  V3 acc = 0.5 * (imu.acc + forward_last_imu_.acc);
+  acc = 0.5 * (imu.acc + forward_last_imu_.acc);
   acc = imu_scale_ * acc;
   acc = acc - ba_;
   
-  V3 gyr = 0.5 * (imu.gyr + forward_last_imu_.gyr) - bg_;
+  gyr = 0.5 * (imu.gyr + forward_last_imu_.gyr) - bg_;
   V3 new_p = fw_p_ + fw_v_ * dt + 0.5 * (fw_R_.R() * acc) * dt * dt + 0.5 * g_ * dt * dt;
   V3 new_v = fw_v_ + fw_R_.R() * acc * dt + g_ * dt;
   SO3 new_R = fw_R_ * SO3::Exp(gyr , dt);
@@ -200,21 +200,31 @@ bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& st
   fw_R_ = new_R;
   fw_v_ = new_v;
   fw_p_ = new_p;
+  forward_time_ = imu.secs;
+  forward_last_imu_ = imu;
+  return true;
+}
 
+void ESKF::ReplayForward(const std::deque<IMUData>& samples) {
+  V3 acc, gyr;
+  for (const auto& imu : samples) {
+    if (imu.secs > forward_time_ && !AdvanceForward(imu, acc, gyr)) break;
+  }
+}
+
+bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& state_robot) {
+  V3 acc, gyr;
+  if (!AdvanceForward(imu, acc, gyr)) return false;
   state_imu.time = imu.secs;
   state_imu.R = fw_R_.R_;
   state_imu.p = fw_p_;
   state_imu.v = fw_v_;
   state_imu.w = gyr;
   state_imu.a = acc;
-  forward_time_ = imu.secs;
-  forward_last_imu_ = imu;
 
-  new_R.R_ = fw_R_.R_ * g_odom_robo.R_;
-  new_p = fw_R_.R_ * ( - g_odom_robo.R_ * g_odom_robo.t_) + fw_p_;
   state_robot.time = imu.secs;
-  state_robot.R = new_R.R_;
-  state_robot.p = new_p;
+  state_robot.R = fw_R_.R_ * g_odom_robo.R_;
+  state_robot.p = fw_R_.R_ * (-g_odom_robo.R_ * g_odom_robo.t_) + fw_p_;
   // todo: v, w, a
 
   return true;
@@ -371,7 +381,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     ba_ = ba_pred;
     g_ = g_pred;
     dx_.setZero();
-    SetImuAnchor(last_imu_);
+    SetLastObsTime(current_time_);
     return false;
   }
 

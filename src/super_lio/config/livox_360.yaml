@@ -48,5 +48,6 @@
     lio.output.map: true
     lio.output.dense: true
     lio.output.pub_step: 1
+    lio.output.max_scan_age: 0.15  # Seconds relative to the latest IMU stamp.
 
     lio.eva.timer: true

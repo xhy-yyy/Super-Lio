@@ -54,6 +54,8 @@ public:
   ~ROSWrapper(){};
   using Ptr = std::shared_ptr<ROSWrapper>;
   bool sync_measure(MeasureGroup&);
+  bool scanFresh(double time) const;
+  void replayForwardImu();
 
   void setESKF(ESKF::Ptr& eskf) { eskf_ = eskf;}
 
@@ -103,10 +105,14 @@ private:
   double last_timestamp_imu_ = -1.0;
   double last_timestamp_lidar_ = -1.0;
   double imu_resume_time_ = -1.0;
+  double max_scan_age_ = 0.0;
 
   ESKF::Ptr eskf_{nullptr};
 
   nav_msgs::msg::Path path_;
+  std::deque<geometry_msgs::msg::PoseStamped> path_history_;
+  double last_path_pub_time_ = -1.0;
+  bool path_dirty_ = false;
   geometry_msgs::msg::PoseStamped msg2uav_;
   sensor_msgs::msg::PointCloud2 global_map_msg_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
