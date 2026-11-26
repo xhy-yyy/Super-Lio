@@ -1,12 +1,13 @@
 #include "lio/ESKF.h"
 
 #include <algorithm>
+#include <cmath>
+
+#include <glog/logging.h>
 
 using namespace BASIC;
 
 namespace LI2Sup{
-
-static constexpr double kMaxImuOnlyTime = 0.5;
 
 /// [1] SEfB: P195：（7.37a） P203: (7.76a) (7.77a)  P220: Table 7-2 
 /// [2] VSLAM14: P71: (4.26)  P73: (4.32)
@@ -82,11 +83,17 @@ void ESKF::SetInitialConditions(Options options, const V3& init_bg,
 
   P_ = 1e-4 * M18::Identity();
   P_.template block<3, 3>(0, 0) = 0.1 * M_PI / 180.0 * M3::Identity();   // r
+  // 加速度计零偏与重力方向的初始不确定度。静止初始化分不开两者（零偏 b 会让世界系歪 b/g），
+  // 给足不确定度后，起飞后一有转动滤波器就能很快把两者估出来。
+  const scalar acc_var = static_cast<scalar>(g_init_acc_bias_std * g_init_acc_bias_std);
+  P_.template block<3, 3>(12, 12) = acc_var * M3::Identity();   // ba
+  P_.template block<3, 3>(15, 15) = acc_var * M3::Identity();   // g
 
 }
 
 
 void ESKF::SetX(const SysState& x) {
+  if (!init_) level_origin_ = x.p.cast<double>();
   last_imu_time_ = x.timestamp;
   current_time_ = last_imu_time_;
   R_ = x.R;
@@ -114,9 +121,10 @@ void ESKF::SetImuAnchor(const IMUData& imu) {
 
 void ESKF::RestartPropagation(const IMUData& imu) {
   const double gap = imu.secs - current_time_;
-  const double dt = std::clamp(gap, 0.0, kMaxImuOnlyTime);
+  const double limit = g_max_imu_only_time > 0.0 ? g_max_imu_only_time : 0.5;
+  const double dt = std::clamp(gap, 0.0, limit);
   p_ += v_ * dt;
-  if (gap > kMaxImuOnlyTime) {
+  if (gap > limit) {
     v_.setZero();
   } else {
     const V3 gyro = 0.5 * (last_imu_.gyr + imu.gyr) - bg_;
@@ -135,6 +143,94 @@ void ESKF::RestartPropagation(const IMUData& imu) {
   P_.diagonal().template segment<3>(6).array() += 4.0 * uncertainty;
   SetImuAnchor(imu);
   last_lidar_fix_time_ = -1;
+}
+
+
+void ESKF::InflateForImuGap(double missing) {
+  // 缺失的 IMU 用两端线性插值代替。按缺失时长 t 计入插值误差：姿态 1 rad/s·t、
+  // 位置 0.5 m/s·t、速度 2 m/s²·t（均为 1σ），使断档期间的雷达观测占主导。
+  if (missing <= 0.0) return;
+  P_.diagonal().template segment<3>(0).array() += std::pow(1.0 * missing, 2);
+  P_.diagonal().template segment<3>(3).array() += std::pow(0.5 * missing, 2);
+  P_.diagonal().template segment<3>(6).array() += std::pow(2.0 * missing, 2);
+}
+
+
+void ESKF::SetVerticalFromGround(const V3& up) {
+  const V3 g_new = -static_cast<scalar>(g_gravity_norm) * up.normalized();
+  ba_ += R_.R().transpose() * (g_new - g_);
+  g_ = g_new;
+  // 地面给出的竖直方向比静止加速度可靠得多：收紧重力方向的不确定度，飞行中主要去估零偏
+  if (g_ground_gravity_std > 0.0) {
+    const scalar var = static_cast<scalar>(g_ground_gravity_std * g_ground_gravity_std);
+    P_.template block<3, 3>(15, 15) = var * M3::Identity();
+  }
+  UpdateLevel(true);
+}
+
+void ESKF::CalibrateMountTilt() {
+  mount_R0_ = R_.R_.cast<double>();
+  mount_calibrated_ = true;
+  const Eigen::Vector3d x_axis = (level_R_ * mount_R0_).col(0).normalized();
+  const Eigen::Vector3d z_axis = (level_R_ * mount_R0_).col(2).normalized();
+  const double tilt = std::atan2(std::hypot(z_axis.x(), z_axis.y()), z_axis.z()) * 180.0 / M_PI;
+  LOG(INFO) << "LiDAR mount tilt calibrated: " << tilt << " deg from level";
+  if (std::abs(x_axis.z()) > 0.966) {   // x 轴与竖直方向夹角小于 15°
+    LOG(WARNING) << "LiDAR x axis is nearly vertical, heading cannot be derived from it reliably";
+  }
+  ApplyMountTilt();
+}
+
+void ESKF::ApplyMountTilt() {
+  // 机体系在雷达(IMU)系中的姿态。调平量更新时一并更新，保证"起飞时机体水平"始终成立。
+  // 机头方向取雷达 x 轴在（调平后的）水平面上的投影：必须在调平后的坐标系里算，否则世界系
+  // 的初始歪斜会按 tan(安装倾角) 折算成航向偏差，机体航向与输出世界系不一致。
+  if (!mount_calibrated_) return;
+  const Eigen::Matrix3d leveled = level_R_ * mount_R0_;
+  const double yaw = std::atan2(leveled(1, 0), leveled(0, 0));
+  const Eigen::Matrix3d body0 = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  g_odom_robo.R_ = (leveled.transpose() * body0).cast<scalar>();
+}
+
+void ESKF::UpdateLevel(bool snap) {
+  if (!g_level_by_gravity) return;
+  // 限速逼近"把估计重力转到正下方"的旋转，避免输出跳变；限幅防止异常估计
+  const double kMaxRate = g_level_max_rate * M_PI / 180.0;   // rad/s
+  constexpr double kMaxTilt = 5.0 * M_PI / 180.0;            // rad
+  const double dt = level_time_ < 0.0 ? 0.0 : std::clamp(current_time_ - level_time_, 0.0, 1.0);
+  level_time_ = current_time_;
+
+  const Eigen::Vector3d g = g_.cast<double>().normalized();
+  const Eigen::Vector3d down(0.0, 0.0, -1.0);
+  const Eigen::Vector3d axis = g.cross(down);
+  const double s = axis.norm();
+  const Eigen::Vector3d target = s > 1e-9 ? Eigen::Vector3d(axis / s * std::atan2(s, g.dot(down)))
+                                          : Eigen::Vector3d(Eigen::Vector3d::Zero());
+  Eigen::Vector3d step = target - level_phi_;
+  const double limit = kMaxRate * dt;
+  if (!snap && step.norm() > limit) step *= limit / step.norm();
+  level_phi_ += step;
+  const double tilt = level_phi_.norm();
+  if (tilt > kMaxTilt) level_phi_ *= kMaxTilt / tilt;
+  level_R_ = tilt > 1e-12 ? Eigen::AngleAxisd(level_phi_.norm(), level_phi_.normalized()).toRotationMatrix()
+                          : Eigen::Matrix3d(Eigen::Matrix3d::Identity());
+  ApplyMountTilt();
+}
+
+void ESKF::LevelPose(M3& R, V3& p, V3& v) const {
+  if (!g_level_by_gravity) return;
+  const M3 L = level_R_.cast<scalar>();
+  const V3 origin = level_origin_.cast<scalar>();
+  R = L * R;
+  p = L * (p - origin) + origin;
+  v = L * v;
+}
+
+NavState ESKF::GetOutputState() const {
+  M3 R = R_.R_;
+  V3 p = p_, v = v_;
+  LevelPose(R, p, v);
+  return NavState(current_time_, SO3(R), p, v);
 }
 
 
@@ -171,7 +267,7 @@ void ESKF::Update() {
 
 bool ESKF::AdvanceForward(const IMUData& imu, V3& acc, V3& gyr) {
   if (!init_ || last_lidar_fix_time_ < 0.0 ||
-      (g_min_match_ratio > 0.0 && imu.secs - last_lidar_fix_time_ > kMaxImuOnlyTime)) {
+      (g_max_imu_only_time > 0.0 && imu.secs - last_lidar_fix_time_ > g_max_imu_only_time)) {
     return false;
   }
 
@@ -215,16 +311,19 @@ void ESKF::ReplayForward(const std::deque<IMUData>& samples) {
 bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& state_robot) {
   V3 acc, gyr;
   if (!AdvanceForward(imu, acc, gyr)) return false;
+  M3 R = fw_R_.R_;
+  V3 p = fw_p_, v = fw_v_;
+  LevelPose(R, p, v);
   state_imu.time = imu.secs;
-  state_imu.R = fw_R_.R_;
-  state_imu.p = fw_p_;
-  state_imu.v = fw_v_;
+  state_imu.R = R;
+  state_imu.p = p;
+  state_imu.v = v;
   state_imu.w = gyr;
   state_imu.a = acc;
 
   state_robot.time = imu.secs;
-  state_robot.R = fw_R_.R_ * g_odom_robo.R_;
-  state_robot.p = fw_R_.R_ * (-g_odom_robo.R_ * g_odom_robo.t_) + fw_p_;
+  state_robot.R = R * g_odom_robo.R_;
+  state_robot.p = R * (-g_odom_robo.R_ * g_odom_robo.t_) + p;
   // todo: v, w, a
 
   return true;
@@ -315,6 +414,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   need_converge_ = false;
   bool accepted = options_.num_iterations_ > 0;
+  last_update_result_ = accepted ? UpdateResult::kAccepted : UpdateResult::kNoObservation;
 
   for (int iter = 0; iter < options_.num_iterations_; ++iter) {
     if (iter > 2) {
@@ -322,8 +422,14 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     }
 
     obs(GetKFState(), HTVH, HTVr);
-    if (!HTVH.allFinite() || !HTVr.allFinite() || HTVH.trace() <= 0.0) {
+    if (!HTVH.allFinite() || !HTVr.allFinite()) {
       accepted = false;
+      last_update_result_ = UpdateResult::kNumerical;
+      break;
+    }
+    if (HTVH.trace() <= 0.0) {
+      accepted = false;
+      last_update_result_ = UpdateResult::kNoObservation;
       break;
     }
 
@@ -363,6 +469,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     dx_ = Qk * b + (K_x - M18::Identity()) * dx_prior;
     if (!dx_.allFinite() || !Qk.allFinite()) {
       accepted = false;
+      last_update_result_ = UpdateResult::kNumerical;
       break;
     }
 
@@ -401,6 +508,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   SetImuAnchor(last_imu_);
   last_lidar_fix_time_ = current_time_;
+  UpdateLevel();
   return true;
 }
 

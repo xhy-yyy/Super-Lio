@@ -29,6 +29,7 @@
                               0.0, 1.0, 0.0, 
                               0.0, 0.0, 1.0]
     lio.extrinsic.odom_robo: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    lio.extrinsic.auto_mount_tilt: true  # 起飞前自动标定雷达安装的俯仰/横滚（假定机体水平停放、朝向不变），机体位姿自动扣除安装倾角。true/false
 
     lio.hash_map.hash_capacity: 2000000
     lio.hash_map.vox_resolution: 0.5
@@ -38,7 +39,14 @@
     lio.kf.kf_align_gravity: true
     lio.kf.kf_quit_eps: 0.001
     lio.kf.plane_huber_delta: 0.05  # Meters (0 disables weighting).
-    lio.kf.min_match_ratio: 0.10
+    lio.kf.min_match_ratio: 0.10        # 低于该比例的帧按比例降权更新（不再硬拒）。范围 0~0.5，0 关闭匹配检查
+    lio.kf.min_inliers: 20              # 内点少于该数视为无观测。范围 10~200
+    lio.kf.inlier_distance: 0.15        # 计入内点的点面距离 (m)。范围 0.05~0.3
+    lio.kf.max_imu_only_time: 0.5       # 距上次雷达更新超过该时间停止前向位姿输出 (s)，0 不限。范围 0.2~1.5
+    lio.kf.init_acc_bias_std: 0.1       # 加速度计零偏/重力方向的初始 1σ (m/s^2)，越大起飞后收敛越快。范围 0.01~0.3
+    lio.kf.init_level_by_ground: true   # 起飞前用周围地面确定竖直方向（假定起飞点地面水平；找不到地面自动跳过）。true/false
+    lio.kf.ground_gravity_std: 0.005    # 地面调平成功后重力方向的 1σ (m/s^2)：越小越信任地面。范围 0.002~0.05，0 不收紧
+    lio.kf.plane_fit_tol: 0.03          # 近邻点到拟合平面的最大距离 (m)。收紧可防止把薄墙两面/相邻面混在一起拟合。范围 0.02~0.1
 
     lio.output.robot: true
     lio.output.plan_env_world: false
@@ -48,6 +56,8 @@
     lio.output.map: true
     lio.output.dense: true
     lio.output.pub_step: 1
+    lio.output.level_by_gravity: true   # 用飞行中估出的重力方向调平输出，消除加速度计零偏造成的"飞远 Z 漂"。true/false
+    lio.output.level_max_rate: 1.0      # 输出调平的最大变化速率 (deg/s)，越大矫正越快。范围 0.2~3.0
     lio.output.max_scan_age: 0.15  # Seconds relative to the latest IMU stamp.
 
     lio.eva.timer: true

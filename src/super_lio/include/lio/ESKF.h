@@ -59,11 +59,27 @@ public:
   using ObsFunc = std::function<void(const KFState& kf_state, BASIC::M6& HT_Vinv_H, BASIC::V6& HT_Vinv_r)>;
   bool UpdateObserve(ObsFunc obs);
 
+  // kNoObservation: 观测不足（匹配点太少）；kNumerical: 观测或解出现非有限值
+  enum class UpdateResult { kAccepted, kNoObservation, kNumerical };
+  UpdateResult LastUpdateResult() const { return last_update_result_; }
+
   double GetTime() const { return current_time_; }
 
   SysState GetSysState() const { return SysState(current_time_, R_, p_, v_, bg_, ba_); }
 
   NavState GetNavState() const { return NavState(current_time_, R_, p_, v_); }
+
+  // 调平后的输出位姿。初始化时世界系按加速度均值对齐重力，加速度计零偏会让世界系歪 b/g
+  // （30 mg ≈ 1.7°），飞远后 Z 随水平距离线性漂。滤波器在飞行中会估出真实重力方向 g_，
+  // 这里用它把输出绕起飞点转平；内部状态和地图不变。
+  NavState GetOutputState() const;
+  void LevelPose(BASIC::M3& R, BASIC::V3& p, BASIC::V3& v) const;
+  // 静止初始化时用地面法向（世界系、朝上）作为真实竖直方向：同时改重力和加速度计零偏，
+  // 保持静止时"比力 + 重力 = 0"成立；输出调平立即到位。
+  void SetVerticalFromGround(const BASIC::V3& up);
+  // 自动标定安装倾角：假定静止初始化时机体水平、航向为 0，此刻雷达相对水平面的姿态就是安装姿态。
+  // 之后机体姿态 = 调平后的雷达姿态 × 安装姿态的逆，雷达以任意俯仰/横滚角安装都不用改外参。
+  void CalibrateMountTilt();
 
   DynamicState GetDynamicState() const { return DynamicState(current_time_, R_.R_, p_, v_, body_omega_, global_acc_); }
 
@@ -79,6 +95,7 @@ public:
   void SetLastObsTime(const double obs_time) { last_obs_time_ = obs_time; }
   void SetImuAnchor(const IMUData& imu);
   void RestartPropagation(const IMUData& imu);
+  void InflateForImuGap(double missing);
   void ReplayForward(const std::deque<IMUData>& samples);
 
   void SetX(const SysState& x);
@@ -94,7 +111,18 @@ private:
   bool AdvanceForward(const IMUData& imu, BASIC::V3& acc, BASIC::V3& gyr);
   void BuildNoise(const Options& options);
   void Update();
-  
+  void UpdateLevel(bool snap = false);
+
+  Eigen::Matrix3d level_R_ = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d level_phi_ = Eigen::Vector3d::Zero();     // 调平旋转向量
+  Eigen::Vector3d level_origin_ = Eigen::Vector3d::Zero();  // 起飞点，调平绕它旋转
+  double level_time_ = -1.0;
+  bool mount_calibrated_ = false;
+  Eigen::Matrix3d mount_R0_ = Eigen::Matrix3d::Identity();  // 初始化时刻的雷达姿态（内部世界系）
+  void ApplyMountTilt();
+
+  UpdateResult last_update_result_ = UpdateResult::kAccepted;
+
   bool  need_converge_  = true;
   float imu_scale_ = 1.0;
   IMUData last_imu_;

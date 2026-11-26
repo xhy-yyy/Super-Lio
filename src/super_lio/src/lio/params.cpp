@@ -54,6 +54,12 @@ namespace LI2Sup{
   double g_kf_quit_eps;
   double g_plane_huber_delta = 0.0;
   double g_min_match_ratio = 0.0;
+  double g_inlier_distance = 0.15;
+  int    g_min_inliers = 20;
+  double g_max_imu_only_time = 0.5;
+  double g_plane_fit_tol = 0.1;
+  double g_init_acc_bias_std = 0.01;
+  bool   g_init_level_by_ground = false;
 
   /// submap 
   double g_submap_resolution;
@@ -66,6 +72,10 @@ namespace LI2Sup{
   bool g_2_ml_map = false;
   bool g_visual_map = true;
   bool g_visual_dense = false;
+  bool g_level_by_gravity = false;
+  double g_level_max_rate = 0.2;
+  double g_ground_gravity_std = 0.0;
+  bool g_auto_mount_tilt = false;
   int  g_pub_step;
 
   /// for planner

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <random>
 #include <sys/resource.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -15,42 +16,33 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
+// 平面拟合：先减去近邻点的质心再做 PCA，取最小特征值方向为法向（几何最小二乘）。
+// 原先解 A·n = -1 最小化的是代数残差，残差会被"平面到原点的距离"缩放：离原点越远，
+// 越偏向法向指向远处的错误平面。走廊里这些错误平面在走廊方向形成伪约束，把位姿锁在原地。
+// 3x3 闭式特征分解比原来 5x3 的列主元 QR 还便宜。
 inline bool calc_plane_coeff(const int N, const std::array<V3, 5>& points, std::array<double, 4>& abcd)
 {
-  Eigen::Vector3d normvec;
-  if (N == 5) {
-    Eigen::Matrix<double, 5, 3> A;
-    Eigen::Matrix<double, 5, 1> b;
-    for (int j = 0; j < 5; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
+  Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+  for (int i = 0; i < N; ++i) centroid += points[i].cast<double>();
+  centroid /= N;
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  for (int i = 0; i < N; ++i) {
+    const Eigen::Vector3d d = points[i].cast<double>() - centroid;
+    cov.noalias() += d * d.transpose();
   }
-  else {
-    Eigen::Matrix<double, 4, 3> A;
-    Eigen::Matrix<double, 4, 1> b;
-
-    for (int j = 0; j < N; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
-  }
-
-  double n = normvec.norm();
-  if (n < 1e-6f) return false;
-
-  abcd[3] = 1.0 / n;
-  normvec *= abcd[3];
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es;
+  es.computeDirect(cov);
+  if (es.eigenvalues()(1) < 1e-8) return false;  // 近邻重合或共线，法向不确定
+  const Eigen::Vector3d normvec = es.eigenvectors().col(0);
   abcd[0] = normvec[0];
   abcd[1] = normvec[1];
   abcd[2] = normvec[2];
-  
+  abcd[3] = -normvec.dot(centroid);
+
   for (int i = 0; i < N; ++i) {
     const V3& p = points[i];
     auto dist = abcd[0] * p(0) + abcd[1] * p(1) + abcd[2] * p(2) + abcd[3];
-    if (std::abs(dist) > 0.1) return false;
+    if (std::abs(dist) > g_plane_fit_tol) return false;
   }
   return true;
 }
@@ -101,6 +93,10 @@ void SuperLIO::stateWaitKFInit()
 void SuperLIO::stateWaitMapInit()
 {
   if (map_init()) {
+    V3 up;
+    if (g_init_level_by_ground && EstimateGroundNormal(up)) kf_->SetVerticalFromGround(up);
+    if (g_auto_mount_tilt) kf_->CalibrateMountTilt();
+    std::vector<Eigen::Vector3d>().swap(ground_cand_);
     kf_->SetImuAnchor(measures_.imu_end);
     kf_->init_ = true;
     data_wrapper_->replayForwardImu();
@@ -135,7 +131,8 @@ bool SuperLIO::kf_init(){
 
   V3 gravity = - mean_acce * g_gravity_norm / mean_acce.norm();
   V3 ref_gravity(0, 0, - g_gravity_norm);
-  M3 init_rot = Quat::FromTwoVectors(gravity, ref_gravity).toRotationMatrix();
+  // 雷达接近倒装时两向量几乎反向，单精度下 FromTwoVectors 的结果不是单位四元数，先归一化
+  M3 init_rot = Quat::FromTwoVectors(gravity, ref_gravity).normalized().toRotationMatrix();
   V3 n = init_rot.col(0);
   double yaw = atan2(n(1), n(0));
 
@@ -165,6 +162,83 @@ bool SuperLIO::kf_init(){
 }
 
 
+// 起飞前静止时，从当前帧（世界系）里找地面平面。加速度计零偏 b 会让世界系歪 b/g，静止时
+// IMU 自己分不开；起飞点周围的地面可以直接给出真实竖直方向。只在初始化时算一次。
+// 找不到可靠地面（点少、范围小、倾角过大）就返回 false，保持纯重力对齐。
+bool SuperLIO::EstimateGroundNormal(V3& up) const {
+  constexpr double kInlier = 0.03, kMaxTiltCos = 0.9962 /* cos 5° */, kMinSpread = 1.0;
+  constexpr std::size_t kMinInliers = 300;
+  const auto& cand = ground_cand_;   // map_init 各帧累积的候选点（相对起飞点，世界系）
+  const auto skip = [&](std::size_t inliers, double spread) {
+    LOG(WARNING) << "Ground plane not found, keeping accelerometer leveling (candidates " << cand.size()
+                 << ", inliers " << inliers << ", spread " << spread << " m)";
+    return false;
+  };
+  if (cand.size() < kMinInliers) return skip(0, 0.0);
+
+  // RANSAC：法向限制在竖直 ±5° 内
+  std::mt19937 rng(20261125);
+  std::uniform_int_distribution<std::size_t> pick(0, cand.size() - 1);
+  Eigen::Vector3d best_n = Eigen::Vector3d::UnitZ();
+  double best_d = 0.0;
+  std::size_t best = 0;
+  long best_score = 0;
+  // 候选点里地面通常只占两三成，三点全落在地面上的概率约 1~3%，采样要足够多
+  for (int it = 0; it < 600; ++it) {
+    const Eigen::Vector3d &a = cand[pick(rng)], &b = cand[pick(rng)], &c = cand[pick(rng)];
+    Eigen::Vector3d n = (b - a).cross(c - a);
+    const double len = n.norm();
+    if (len < 1e-3) continue;
+    n /= len;
+    if (n.z() < 0.0) n = -n;
+    if (n.z() < kMaxTiltCos) continue;
+    const double d = -n.dot(a);
+    // 评分 = 内点数 − 2×平面下方的点数。地面是最低的面，下方不该有点；略微倾斜、同时蹭到地面和
+    // 墙根的平面内点数可能相近，但会把一侧的真实地面点压在下面。
+    long count = 0, under = 0;
+    for (const auto& q : cand) {
+      const double e = n.dot(q) + d;
+      count += std::abs(e) < kInlier;
+      under += e < -0.05;
+    }
+    const long score = count - 2 * under;
+    if (score > best_score) { best_score = score; best = static_cast<std::size_t>(count); best_n = n; best_d = d; }
+  }
+  std::size_t below = 0;
+  for (const auto& q : cand) below += best_n.dot(q) + best_d < -0.05;
+  if (best < kMinInliers || below * 5 > best) return skip(best, 0.0);
+
+  // 内点上做 PCA 精修（重新选内点 → 重新拟合，迭代 3 轮），并检查地面覆盖范围
+  Eigen::Vector3d n = best_n;
+  double d = best_d;
+  std::size_t n_in = 0;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es;
+  for (int round = 0; round < 3; ++round) {
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    n_in = 0;
+    for (const auto& q : cand) if (std::abs(n.dot(q) + d) < kInlier) { mean += q; ++n_in; }
+    if (n_in < kMinInliers) return skip(n_in, 0.0);
+    mean /= static_cast<double>(n_in);
+    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    for (const auto& q : cand) {
+      if (std::abs(n.dot(q) + d) < kInlier) cov.noalias() += (q - mean) * (q - mean).transpose();
+    }
+    es.computeDirect(cov / static_cast<double>(n_in));
+    Eigen::Vector3d refined = es.eigenvectors().col(0);
+    if (refined.z() < 0.0) refined = -refined;
+    n = refined;
+    d = -n.dot(mean);
+  }
+  const double spread = std::sqrt(es.eigenvalues()(1));
+  if (spread < kMinSpread || n.z() < kMaxTiltCos) return skip(n_in, spread);
+
+  up = n.cast<scalar>();
+  LOG(INFO) << GREEN << " ---> [SuperLIO]: ground plane found (" << n_in << " points), world tilt "
+            << std::acos(std::min(1.0, n.z())) * 180.0 / M_PI << " deg corrected" << RESET;
+  return true;
+}
+
+
 bool SuperLIO::map_init(){
   frame_num_++;
 
@@ -185,6 +259,15 @@ bool SuperLIO::map_init(){
   );
 
   ivox_->insert(points_world_v3_);
+
+  if (g_init_level_by_ground) {   // 累积地平线附近及以下的点，供起飞前的地面拟合使用
+    const Eigen::Vector3d origin = sys_init_pose_.t_.cast<double>();
+    for (const auto& p : points_world_v3_) {
+      const Eigen::Vector3d d = p.cast<double>() - origin;
+      const double r = std::hypot(d.x(), d.y());
+      if (r > 1.0 && r < 15.0 && d.z() < 0.05 + 0.05 * r) ground_cand_.push_back(d);
+    }
+  }
 
   // 20 Hz for 1.0 seconds. Integral coverage area > 70%
   if(frame_num_ > 3){
@@ -376,6 +459,7 @@ void SuperLIO::Propagation_Undistort(){
   if (kf_->GetTime() < measures_.imu_end.secs && kf_->Predict(measures_.imu_end)) {
     propagate_states_.emplace_back(kf_->GetDynamicState());
   }
+  kf_->InflateForImuGap(measures_.imu_gap);
   std::vector<Quat> rotations;
   rotations.reserve(propagate_states_.size());
   for (const auto& state : propagate_states_) rotations.emplace_back(state.R);
@@ -436,10 +520,16 @@ struct ThreadACC{
 bool SuperLIO::Observe(){
   size_t ptsize = ds_undistort_->size();
   const double huber_delta = g_plane_huber_delta;
-  const std::size_t min_inliers = g_min_match_ratio > 0.0
-      ? std::max<std::size_t>(20, std::ceil(g_min_match_ratio * ptsize)) : 1;
-  const double inlier_distance = g_min_match_ratio > 0.0 ? 0.15 : std::numeric_limits<double>::infinity();
-  
+  // 匹配质量分级（min_match_ratio=0 时与旧版一致：不检查）：
+  //   内点 < min_inliers        → 没有可用观测，本帧不更新；
+  //   内点 < ratio × 点数       → 照常更新，但信息按 内点/期望内点 缩小（低重叠帧更信 IMU 预测），
+  //                               进入新区域时仍有约束、地图能继续生长，不会因硬拒而锁死。
+  const bool guard = g_min_match_ratio > 0.0;
+  const std::size_t min_inliers = guard ? static_cast<std::size_t>(g_min_inliers) : 1;
+  const std::size_t full_inliers = guard
+      ? std::max<std::size_t>(min_inliers, std::ceil(g_min_match_ratio * ptsize)) : 1;
+  const double inlier_distance = guard ? g_inlier_distance : std::numeric_limits<double>::infinity();
+
   static std::vector<float> _lengths;
   points_body_v3_.resize(ptsize);
   _lengths.resize(ptsize);
@@ -530,6 +620,11 @@ bool SuperLIO::Observe(){
       HTVr.setZero();
       return;
     }
+    if (inliers < full_inliers) {
+      const double scale = static_cast<double>(inliers) / static_cast<double>(full_inliers);
+      sum_HTVH *= scale;
+      sum_HTVr *= scale;
+    }
     HTVH = sum_HTVH.cast<scalar>();
     HTVr = sum_HTVr.cast<scalar>();
 
@@ -551,7 +646,9 @@ bool SuperLIO::Observe(){
 
   frame_num_++;
   if (!accepted) {
-    LOG_EVERY_N(WARNING, 20) << "Skipping LiDAR scan without a reliable pose update";
+    const bool no_obs = kf_->LastUpdateResult() == ESKF::UpdateResult::kNoObservation;
+    LOG_EVERY_N(WARNING, 20) << "Skipping LiDAR scan without a reliable pose update ("
+                             << (no_obs ? "too few matches" : "non-finite update") << ")";
     return false;
   }
   data_wrapper_->replayForwardImu();
@@ -580,7 +677,7 @@ void SuperLIO::UpdateMap() {
 
 
 void SuperLIO::Output(){
-  auto state = kf_->GetNavState();
+  auto state = kf_->GetOutputState();
   data_wrapper_->pub_odom(state);
   if (!g_visual_map) return;
 

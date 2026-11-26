@@ -64,7 +64,7 @@ public:
     imu_buffer_.clear();
     last_timestamp_imu_ = -1.0;
     last_timestamp_lidar_ = -1.0;
-    imu_resume_time_ = -1.0;
+    imu_gaps_.clear();
   }
 
   void pub_odom(const NavState&);
@@ -104,7 +104,7 @@ private:
   std::deque<LidarData> lidar_buffer_;
   double last_timestamp_imu_ = -1.0;
   double last_timestamp_lidar_ = -1.0;
-  double imu_resume_time_ = -1.0;
+  std::deque<std::pair<double, double>> imu_gaps_;   // IMU 断档区间 [前一样本, 后一样本]
   double max_scan_age_ = 0.0;
 
   ESKF::Ptr eskf_{nullptr};

@@ -71,6 +71,12 @@ namespace LI2Sup{
   extern double g_kf_quit_eps;
   extern double g_plane_huber_delta;
   extern double g_min_match_ratio;
+  extern double g_inlier_distance;      // 计入匹配比例的点面距离上限 (m)
+  extern int    g_min_inliers;          // 少于该内点数视为没有可用观测
+  extern double g_max_imu_only_time;    // 距上次雷达更新超过该时间 (s) 停止前向位姿输出，0 不限
+  extern bool   g_init_level_by_ground; // 初始化时用起飞点周围的地面确定竖直方向
+  extern double g_init_acc_bias_std;    // 加速度计零偏/重力方向的初始 1σ (m/s^2)
+  extern double g_plane_fit_tol;        // 近邻点到拟合平面的最大距离 (m)，超过则不用这个平面
 
   /// submaps
   extern double g_submap_resolution;
@@ -83,6 +89,10 @@ namespace LI2Sup{
   extern bool g_2_ml_map;
   extern bool g_visual_map;
   extern bool g_visual_dense;
+  extern bool g_auto_mount_tilt;        // 初始化时自动标定雷达安装倾角（假定机体水平）
+  extern double g_level_max_rate;       // 输出调平的最大变化速率 (deg/s)
+  extern double g_ground_gravity_std;   // 地面调平成功后重力方向的 1σ (m/s^2)，0 表示不收紧
+  extern bool g_level_by_gravity;       // 输出位姿按估计的重力方向调平
   extern int  g_pub_step;
 
   /// for planner

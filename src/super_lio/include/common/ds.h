@@ -131,6 +131,7 @@ struct MeasureGroup {
   LidarData lidar;
   std::deque<IMUData> imu;
   IMUData imu_end;
+  double imu_gap = 0.0;   // 本帧预测区间内缺失 IMU 的总时长 (s)，用线性插值代替
 };
 
 

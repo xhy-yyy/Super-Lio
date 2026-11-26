@@ -8,9 +8,13 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
-static constexpr std::size_t kLidarQueueDepth = 20;
-static constexpr std::size_t kImuQueueDepth = 500;
-static constexpr double kImuHistorySeconds = 1.0;
+static constexpr std::size_t kLidarQueueDepth = 20;      // 约 2 s 雷达
+// IMU 历史必须长于雷达队列：处理卡顿或雷达短暂断流后，积压的帧仍能拿到完整 IMU，
+// 不必重新锚定。200 Hz × 5 s = 1000 个样本，内存可忽略。
+static constexpr std::size_t kImuQueueDepth = 1200;
+static constexpr double kImuHistorySeconds = 5.0;
+static constexpr double kDefaultMaxScanLag = 0.2;        // 未配置 max_scan_age 时的跳帧门限 (s)
+static constexpr std::size_t kMaxImuGaps = 32;
 static constexpr std::size_t kPathHistorySize = 2000;
 static constexpr double kPathPublishPeriod = 0.2;
 
@@ -132,6 +136,7 @@ void LoadParamFromRos(rclcpp::Node& node)
                         Eigen::Vector3d::UnitZ())
           .toRotationMatrix();
   g_lidar_robo_yaw = temp_R_yaw.cast<scalar>();
+  g_auto_mount_tilt = node.declare_parameter<bool>("lio.extrinsic.auto_mount_tilt", false);
 
   // ================= hash map =================
   node.declare_parameter<int>("lio.hash_map.hash_capacity", 1000000);
@@ -154,6 +159,12 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.get_parameter("lio.kf.kf_quit_eps", g_kf_quit_eps);
   g_plane_huber_delta = node.declare_parameter<double>("lio.kf.plane_huber_delta", 0.0);
   g_min_match_ratio = std::clamp(node.declare_parameter<double>("lio.kf.min_match_ratio", 0.0), 0.0, 1.0);
+  g_inlier_distance = node.declare_parameter<double>("lio.kf.inlier_distance", g_inlier_distance);
+  g_min_inliers = std::max(1, static_cast<int>(node.declare_parameter<int>("lio.kf.min_inliers", g_min_inliers)));
+  g_max_imu_only_time = node.declare_parameter<double>("lio.kf.max_imu_only_time", g_max_imu_only_time);
+  g_plane_fit_tol = node.declare_parameter<double>("lio.kf.plane_fit_tol", g_plane_fit_tol);
+  g_init_acc_bias_std = node.declare_parameter<double>("lio.kf.init_acc_bias_std", g_init_acc_bias_std);
+  g_init_level_by_ground = node.declare_parameter<bool>("lio.kf.init_level_by_ground", g_init_level_by_ground);
 
   // submaps
   node.declare_parameter<double>("lio.submap.submap_resolution", 0.0);
@@ -183,6 +194,9 @@ void LoadParamFromRos(rclcpp::Node& node)
 
   node.declare_parameter<bool>("lio.output.dense", false);
   node.get_parameter("lio.output.dense", g_visual_dense);
+  g_level_by_gravity = node.declare_parameter<bool>("lio.output.level_by_gravity", false);
+  g_level_max_rate = node.declare_parameter<double>("lio.output.level_max_rate", g_level_max_rate);
+  g_ground_gravity_std = node.declare_parameter<double>("lio.kf.ground_gravity_std", g_ground_gravity_std);
 
   g_pub_step = node.declare_parameter<int>("lio.output.pub_step", 1);
   if (g_pub_step < 1) {
@@ -381,10 +395,11 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
 
   const double gap = data.secs - last_timestamp_imu_;
   if (g_imu_max_gap > 0.0 && last_timestamp_imu_ >= 0.0 && gap > g_imu_max_gap) {
-    LOG(WARNING) << "IMU gap of " << gap << " s. Discarding scans that cross the gap";
-    imu_buffer_.clear();
-    imu_resume_time_ = data.secs;
-    if (eskf_->init_) eskf_->RestartPropagation(data);
+    // 只记录断档区间，断档前后的 IMU 都保留。断档内的雷达帧照常处理：帧间用断档两端样本的
+    // 线性插值预测（每帧只预测 0.1 s），并按缺失时长放大预测协方差，让雷达观测主导。
+    LOG(WARNING) << "IMU gap of " << gap << " s. Bridging it with interpolated IMU and LiDAR updates";
+    imu_gaps_.emplace_back(last_timestamp_imu_, data.secs);
+    if (imu_gaps_.size() > kMaxImuGaps) imu_gaps_.pop_front();
   }
 
   imu_buffer_.push_back(data);
@@ -565,11 +580,29 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
 
   const double oldest_imu = imu_buffer_.front().secs;
   const bool history_lost = eskf_->init_ && eskf_->GetTime() < oldest_imu;
-  const double earliest_scan = history_lost ? oldest_imu : imu_resume_time_;
+  while (!imu_gaps_.empty() && imu_gaps_.front().second < last_timestamp_lidar_) imu_gaps_.pop_front();
+  // [a, b] 与 IMU 断档的重叠时长
+  const auto gap_overlap = [this](double a, double b) {
+    double sum = 0.0;
+    for (const auto& gap : imu_gaps_) sum += std::max(0.0, std::min(b, gap.second) - std::max(a, gap.first));
+    return sum;
+  };
+  const double max_lag = max_scan_age_ > 0.0 ? max_scan_age_ : kDefaultMaxScanLag;
+  // 跳过的帧不更新 last_timestamp_lidar_，下一帧会把跳过时段的 IMU 一并积分。
   while (!lidar_buffer_.empty()) {
     const auto& lidar = lidar_buffer_.front();
-    if (lidar.start_time >= earliest_scan && lidar.end_time > last_timestamp_lidar_ &&
-        lidar.end_time >= oldest_imu) break;
+    const bool unusable = lidar.end_time <= last_timestamp_lidar_ || lidar.end_time < oldest_imu ||
+                          (history_lost && lidar.start_time < oldest_imu);
+    // 积压追赶：后面已有 IMU 覆盖的新帧、而当前帧已过时，直接处理新帧（输出始终新鲜，也省算力）。
+    // 落在 IMU 断档里的帧不跳：断档期间要靠逐帧雷达校正，跳过就等于一步积过整个断档。
+    const bool behind = eskf_->init_ && lidar_buffer_.size() > 1 &&
+                        lidar_buffer_[1].end_time <= last_timestamp_imu_ &&
+                        last_timestamp_imu_ - lidar.end_time > max_lag &&
+                        gap_overlap(lidar.start_time, lidar.end_time) <= 0.0;
+    if (!unusable && !behind) break;
+    if (behind && !unusable) {
+      LOG_EVERY_N(WARNING, 20) << "Processing is behind. Skipping a stale scan";
+    }
     lidar_buffer_.pop_front();
   }
   if (lidar_buffer_.empty()) return false;
@@ -582,6 +615,7 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
   }
   meas.lidar = std::move(lidar_buffer_.front());
   lidar_buffer_.pop_front();
+  meas.imu_gap = eskf_->init_ ? gap_overlap(std::max(last_timestamp_lidar_, eskf_->GetTime()), end) : 0.0;
 
   meas.imu.clear();
   // Keep the last raw sample on the left for scans sharing an IMU interval.

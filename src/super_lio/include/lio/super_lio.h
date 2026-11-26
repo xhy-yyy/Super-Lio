@@ -46,6 +46,7 @@ protected:
   void Propagation_Undistort();
   void DownSample();
   bool Observe();
+  bool EstimateGroundNormal(BASIC::V3& up) const;
   virtual void UpdateMap();
   virtual void Output();
   void caceData();
@@ -71,6 +72,7 @@ protected:
   BASIC::SE3 sys_init_pose_;
   BASIC::SE3 last_pose_;
 
+  std::vector<Eigen::Vector3d> ground_cand_;   // 初始化阶段累积的地面候选点
   std::size_t effect_knn_num_ = 0;
   BASIC::VV3 points_world_v3_, points_body_v3_;
   std::vector<uint8_t> effect_mask_;

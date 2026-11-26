@@ -16,42 +16,33 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
+// 平面拟合：先减去近邻点的质心再做 PCA，取最小特征值方向为法向（几何最小二乘）。
+// 原先解 A·n = -1 最小化的是代数残差，残差会被"平面到原点的距离"缩放：离原点越远，
+// 越偏向法向指向远处的错误平面。走廊里这些错误平面在走廊方向形成伪约束，把位姿锁在原地。
+// 3x3 闭式特征分解比原来 5x3 的列主元 QR 还便宜。
 inline bool calc_plane_coeff(const int N, const std::array<V3, 5>& points, std::array<double, 4>& abcd)
 {
-  Eigen::Vector3d normvec;
-  if (N == 5) {
-    Eigen::Matrix<double, 5, 3> A;
-    Eigen::Matrix<double, 5, 1> b;
-    for (int j = 0; j < 5; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
+  Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+  for (int i = 0; i < N; ++i) centroid += points[i].cast<double>();
+  centroid /= N;
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  for (int i = 0; i < N; ++i) {
+    const Eigen::Vector3d d = points[i].cast<double>() - centroid;
+    cov.noalias() += d * d.transpose();
   }
-  else {
-    Eigen::Matrix<double, 4, 3> A;
-    Eigen::Matrix<double, 4, 1> b;
-
-    for (int j = 0; j < N; j++) {
-      A.row(j) = points[j].cast<double>();
-      b(j) = -1.0;
-    }
-    normvec = A.colPivHouseholderQr().solve(b);
-  }
-
-  double n = normvec.norm();
-  if (n < 1e-6f) return false;
-
-  abcd[3] = 1.0 / n;
-  normvec *= abcd[3];
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es;
+  es.computeDirect(cov);
+  if (es.eigenvalues()(1) < 1e-8) return false;  // 近邻重合或共线，法向不确定
+  const Eigen::Vector3d normvec = es.eigenvectors().col(0);
   abcd[0] = normvec[0];
   abcd[1] = normvec[1];
   abcd[2] = normvec[2];
-  
+  abcd[3] = -normvec.dot(centroid);
+
   for (int i = 0; i < N; ++i) {
     const V3& p = points[i];
     auto dist = abcd[0] * p(0) + abcd[1] * p(1) + abcd[2] * p(2) + abcd[3];
-    if (std::abs(dist) > 0.1) return false;
+    if (std::abs(dist) > g_plane_fit_tol) return false;
   }
   return true;
 }
