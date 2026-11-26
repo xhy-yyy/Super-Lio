@@ -106,6 +106,8 @@ private:
   double last_timestamp_lidar_ = -1.0;
   std::deque<std::pair<double, double>> imu_gaps_;   // IMU 断档区间 [前一样本, 后一样本]
   double max_scan_age_ = 0.0;
+  bool log_pose_ = false;
+  rclcpp::Clock pose_log_clock_{RCL_STEADY_TIME};
 
   ESKF::Ptr eskf_{nullptr};
 

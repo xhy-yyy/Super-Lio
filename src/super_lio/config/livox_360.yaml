@@ -11,7 +11,7 @@
     lio.ros.imu_topic: "/livox/imu"
 
     lio.sensor.lidar_type: 1
-    lio.sensor.blind: 2.0
+    lio.sensor.blind: 0.5
     lio.sensor.maxrange: 60.0
     lio.sensor.filter_rate: 3
     lio.sensor.enable_downsample: true
@@ -56,6 +56,7 @@
     lio.output.map: true
     lio.output.dense: true
     lio.output.pub_step: 1
+    lio.output.log_pose: true
     lio.output.level_by_gravity: true   # 用飞行中估出的重力方向调平输出，消除加速度计零偏造成的"飞远 Z 漂"。true/false
     lio.output.level_max_rate: 1.0      # 输出调平的最大变化速率 (deg/s)，越大矫正越快。范围 0.2~3.0
     lio.output.max_scan_age: 0.15  # Seconds relative to the latest IMU stamp.

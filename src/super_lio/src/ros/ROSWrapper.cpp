@@ -3,6 +3,7 @@
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 using namespace BASIC;
 
@@ -307,6 +308,7 @@ ROSWrapper::ROSWrapper(const rclcpp::NodeOptions& options)
 : rclcpp::Node("super_lio", options)
 {
   LoadParamFromRos(*this);
+  log_pose_ = declare_parameter<bool>("lio.output.log_pose", false);
   max_scan_age_ = declare_parameter<double>("lio.output.max_scan_age", 0.0);
   LOG(INFO) << GREEN << " ---> Using Lidar type: "
             << lidarTypeToString(g_lidar_type) << RESET;
@@ -723,6 +725,16 @@ void ROSWrapper::pub_odom(const NavState& state){
   tf_msg.transform.rotation.w = temp_q.w();
 
   tf_broadcaster_->sendTransform(tf_msg);
+
+  if (log_pose_) {
+    const auto& q = odom.pose.pose.orientation;
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), pose_log_clock_, 1000,
+        "x=%+.3f y=%+.3f z=%+.3f yaw=%+.2f deg",
+        state.p[0], state.p[1], state.p[2],
+        std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                   q.w * q.w + q.x * q.x - q.y * q.y - q.z * q.z) * 180.0 / M_PI);
+  }
 
   // tf_msg.child_frame_id = "god";
   // tf_msg.transform.rotation.x = 0.0;
